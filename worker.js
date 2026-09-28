@@ -1,8 +1,10 @@
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — openhands-worker.js
- * BUILD: ohp service 1.0 (the current one-and-only build)
+ * BUILD: ohp service 1.1 (adds v6.9: programmatic form.submit()
+ *   interception for IdP auto-submit forms — GitHub 2FA — plus
+ *   failure diagnostics: x-ohp-up / x-ohp-errbody on 4xx/5xx)
  *   Deploy check: /__status on the worker URL must answer
- *   "ohp service 1.0" — anything else means an old copy is
+ *   "ohp service 1.1" — anything else means an old copy is
  *   still deployed; replace it with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES — the "no-navigation" architecture, ported
@@ -101,7 +103,7 @@
  *     them as x-cookie. Nothing is stored at this origin.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.0';
+const VERSION = 'ohp service 1.1';
 
 /* OpenHands first-party family (suffix match — covers subdomains).
  * all-hands.dev covers app.all-hands.dev (the app + its API),
@@ -1313,6 +1315,56 @@ const PATCH_JS = [
 "          }",
 "        } catch (errS) { /* ignore */ }",
 "      }, true);",
+"",
+"      /* ---------- v6.9: programmatic form.submit() --------------------",
+"       * IdP pages auto-submit their verification forms programmatically:",
+"       * GitHub's 2FA page calls form.submit() the instant the 6th code",
+"       * digit lands. A programmatic submit fires NO 'submit' event, so",
+"       * the arm above never sees it \u2014 the native submission would steer",
+"       * the sandbox frame to the action URL (or the Navigation API",
+"       * handler would nav() the destination WITHOUT the form body), and",
+"       * the upstream answers 422 (Rails: missing authenticity_token).",
+"       * Route programmatic submits through the exact same serialize +",
+"       * nav() path as clicked submits. */",
+"      try {",
+"        var _formSubmit = HTMLFormElement.prototype.submit;",
+"        HTMLFormElement.prototype.submit = function () {",
+"          try {",
+"            if (!SD) return _formSubmit.apply(this, arguments);",
+"            var f = this;",
+"            if (!f || !f.getAttribute) return _formSubmit.apply(f, arguments);",
+"            var action = f.getAttribute('action') || '';",
+"            if (!action || action === '#' || action.charAt(0) === '#' || /^javascript:/i.test(action)) {",
+"              return _formSubmit.apply(f, arguments); /* SPA-managed: native */",
+"            }",
+"            var dest = action;",
+"            if (isWorkerUrl(dest)) {",
+"              var serW = serializeForm(f);",
+"              if ((serW.method || 'GET') === 'GET') {",
+"                var baseW = dest.split('#')[0].split('?')[0];",
+"                nav(baseW + (serW.body ? '?' + serW.body : ''));",
+"              } else {",
+"                nav(dest, serW.method, serW.body, serW.ct);",
+"              }",
+"              return undefined;",
+"            }",
+"            if (/^https?:\\/\\//i.test(dest) && !allowedHost((dest.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1])) {",
+"              up({ type: 'ext', url: dest });",
+"              return undefined;",
+"            }",
+"            var ser = serializeForm(f);",
+"            if ((ser.method || 'GET') === 'GET') {",
+"              var base = dest.split('#')[0].split('?')[0];",
+"              nav(base + (ser.body ? '?' + ser.body : ''));",
+"            } else {",
+"              nav(dest, ser.method, ser.body, ser.ct);",
+"            }",
+"            return undefined;",
+"          } catch (eFS) {",
+"            try { return _formSubmit.apply(this, arguments); } catch (eFS2) { /* ignore */ }",
+"          }",
+"        };",
+"      } catch (eProto) { /* ignore */ }",
 "    }",
 "  } catch (eSubArm) { /* ignore */ }",
 "",
@@ -2240,6 +2292,16 @@ async function handle(req, event) {
       const html = rewriteHtml(text, pfx, host, new URL(req.url).origin, token, allowList(event),
         tokMode ? upUrl.toString() : null);
       const htmlRes = new Response(html, { status: res.status, headers: outCt });
+      /* ---- v6.9: failure diagnostics ------------------------------------
+       * A 4xx/5xx DOCUMENT (an IdP or upstream refusing a relayed step)
+       * carries a short escaped body snippet so the pocket's error card
+       * can say WHICH upstream failed and WHY, instead of a bare number. */
+      try {
+        if (res.status >= 400) {
+          htmlRes.headers.set('x-ohp-errbody', encodeURIComponent(String(text).replace(/\s+/g, ' ').slice(0, 240)));
+          htmlRes.headers.set('x-ohp-up', upUrl.toString());
+        }
+      } catch (eErrBody) { /* never let diagnostics break a document */ }
       /* ---- v6.7: boot cookie-seed ---------------------------------------
        * When the pocket's document fetch arrived with REAL browser
        * cookies for this worker (credentials:'include' mode), the
@@ -2274,6 +2336,19 @@ async function handle(req, event) {
       const text = await res.text();
       const css = rewriteCss(text, pfx, host, allowList(event), tokMode ? upUrl.toString() : null, new URL(req.url).origin);
       return new Response(css, { status: res.status, headers: outCt });
+    }
+    /* ---- v6.9: buffered error bodies (JSON/plain) ---------------------
+     * Upstream 4xx/5xx JSON (FastAPI {"detail":...}, OAuth errors) is the
+     * other shape a failed document load lands on; buffer it, attach the
+     * diagnostic headers, and pass it through. */
+    if (res.status >= 400 && (ct.includes('json') || ct.includes('text/plain'))) {
+      const text = await res.text();
+      const h2 = new Headers(outCt);
+      try {
+        h2.set('x-ohp-errbody', encodeURIComponent(String(text).replace(/\s+/g, ' ').slice(0, 240)));
+        h2.set('x-ohp-up', upUrl.toString());
+      } catch (eErrB2) { /* ignore */ }
+      return new Response(text, { status: res.status, headers: h2 });
     }
     /* ---- v5: JavaScript location-assignment rewrite ----------------
      * Inside the sandbox frame the document lives at about:srcdoc; a
@@ -2506,7 +2581,7 @@ function corsHeaders(req, h) {
   h.set('access-control-allow-methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
   const reqH = req.headers.get('access-control-request-headers');
   h.set('access-control-allow-headers', reqH || '*');
-  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed');
+  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-errbody, x-ohp-up');
   h.set('access-control-max-age', '86400');
   return h;
 }
