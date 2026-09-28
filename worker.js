@@ -1,10 +1,14 @@
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — openhands-worker.js
- * BUILD: ohp service 1.1 (adds v6.9: programmatic form.submit()
- *   interception for IdP auto-submit forms — GitHub 2FA — plus
- *   failure diagnostics: x-ohp-up / x-ohp-errbody on 4xx/5xx)
+ * BUILD: ohp service 1.2 (adds v6.10: navigation-chain mode — the
+ *   worker walks the OAuth sign-in redirect chain itself, folding
+ *   every hop's Set-Cookie into the next hop and re-issuing the union
+ *   on the final response, so sign-ins survive browsers that cannot
+ *   store this origin's cookies; jar-over-browser cookie precedence;
+ *   precise 502 diagnostics when a provider redirect leaves the
+ *   allowlist. Keeps v6.9 form.submit() + x-ohp-up/x-ohp-errbody.)
  *   Deploy check: /__status on the worker URL must answer
- *   "ohp service 1.1" — anything else means an old copy is
+ *   "ohp service 1.2" — anything else means an old copy is
  *   still deployed; replace it with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES — the "no-navigation" architecture, ported
@@ -74,6 +78,12 @@
  *                   every origin (the pocket file fetches it),
  *                   every method, cookies relayed via x-set-cookie
  *                   + x-cookie, final URL reported as x-final-url.
+ *                   With the request header x-ohp-nav: 1 (the pocket's
+ *                   document loader) the worker walks the upstream 30x
+ *                   chain itself, folding every hop's Set-Cookie into
+ *                   the next hop and re-issuing the union on the final
+ *                   response (v6.10 — sign-in chains survive browsers
+ *                   that cannot store this origin's cookies at all).
  *   /__o/<token><path> -> path-preserving origin token (v6
  *                   form): keeps relative URL resolution working
  *                   for dynamic import() and css url().
@@ -103,7 +113,7 @@
  *     them as x-cookie. Nothing is stored at this origin.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.1';
+const VERSION = 'ohp service 1.2';
 
 /* OpenHands first-party family (suffix match — covers subdomains).
  * all-hands.dev covers app.all-hands.dev (the app + its API),
@@ -2170,7 +2180,7 @@ async function handle(req, event) {
      * the query — strip it before going upstream. Token requests carry
      * their whole query INSIDE the token; any extra params the browser
      * appended (e.g. EventSource adding __t) are merged in, minus __t. */
-    const upUrl = new URL(upstream);
+    let upUrl = new URL(upstream);
     if (tokMode) {
       for (const [k, v] of url.searchParams) {
         if (k === '__t') continue;
@@ -2215,7 +2225,12 @@ async function handle(req, event) {
         h.set('accept-encoding', 'identity');
       }
     } catch (eAE) { /* keep */ }
-    h.set('cookie', mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''));
+    /* v6.10: the runtime jar (x-cookie, refreshed by x-set-cookie on
+     * every response) is ALWAYS at least as fresh as whatever the
+     * browser's cookie store holds for this origin — and a STALE store
+     * value used to win this merge, poisoning fresh sign-ins with dead
+     * session cookies. Jar first; the browser store fills gaps only. */
+    h.set('cookie', mergeCookies(req.headers.get('x-cookie') || '', req.headers.get('cookie') || ''));
     h.set('origin', 'https://' + host);
     h.set('referer', 'https://' + host + '/');
 
@@ -2235,43 +2250,135 @@ async function handle(req, event) {
     let res;
     let retried = false;
     let recoveryCookies = []; /* v6.4: fresh set-cookies gathered below */
-    try {
-      const fetchInit = { method: method, headers: h, redirect: 'manual' };
-      if (body !== undefined) fetchInit.body = body;
-      if (needDuplex) fetchInit.duplex = 'half';
-      res = await fetch(upUrl.toString(), fetchInit);
-      /* ---- transient refusal retry --------------------------------------
-       * A 403/429 occasionally comes from WAF-style edge rules fed by
-       * leftover request headers rather than real auth or rate state.
-       * One clean minimal-header attempt (app-style origin/referer, no
-       * forwarded edge headers) recovers those; anything that survives
-       * it is a real answer and passes through untouched. OpenHands
-       * auth failures (401) are NOT retried — an expired token will
-       * not heal in place, and the app's own login flow owns it. */
-      const isRead = method === 'GET' || method === 'HEAD';
-      if ((res.status === 403 || res.status === 429) && isRead) {
+    /* ---- v6.10: navigation-chain mode -----------------------------------
+     * The pocket's document loader sends x-ohp-nav: 1 on every page load
+     * (link clicks, form submits, SPA redirects — the entire OAuth
+     * sign-in chain). A cross-origin fetch() cannot inspect the 30x hops
+     * it follows (opaque-redirect), and a file:// pocket often cannot
+     * store this origin's partitioned cookies at all — so every
+     * Set-Cookie living on an INTERMEDIATE hop (Keycloak AUTH_SESSION_ID,
+     * GitHub session cookies, the app session the FastAPI OAuth callback
+     * sets mid-chain) used to vanish between hops: the IdP flow looped
+     * (auth pages "flashing") and a finished sign-in landed back on the
+     * login page, logged out, forever. Here the WORKER walks the chain
+     * itself: each hop's Set-Cookies are folded into the next hop's
+     * Cookie header (freshest wins) and collected, and the FINAL
+     * response carries the union on x-set-cookie — the pocket's jar (and
+     * the sandbox it boots from frame.name) heals in one shot. */
+    const navMode = (req.headers.get('x-ohp-nav') || '') === '1' && !needDuplex;
+    const chainCookies = []; /* raw Set-Cookie strings from every followed hop */
+    const chainHosts = [];  /* distinct upstream hosts visited, for diagnostics */
+    const CHAIN_MAX_HOPS = 20;
+    const rawSetCookies = (r) => {
+      try {
+        if (typeof r.headers.getSetCookie === 'function') return r.headers.getSetCookie();
+        const single = r.headers.get('set-cookie');
+        return single ? [single] : [];
+      } catch (e) { return []; }
+    };
+    /* ---- transient refusal retry (reads only) ---------------------------
+     * A 403/429 occasionally comes from WAF-style edge rules fed by
+     * leftover request headers rather than real auth or rate state. One
+     * clean minimal-header attempt (app-style origin/referer, no
+     * forwarded edge headers) recovers those; anything that survives it
+     * is a real answer and passes through untouched. OpenHands auth
+     * failures (401) are NOT retried — an expired token will not heal in
+     * place, and the app's own login flow owns it. */
+    const hopRetry = async (r, u, m) => {
+      if ((r.status === 403 || r.status === 429) && (m === 'GET' || m === 'HEAD')) {
         try {
-          const res2 = await fetch(upUrl.toString(), { method: method, headers: minimalHeaders(req, host), redirect: 'manual' });
+          const r2 = await fetch(u, { method: m, headers: minimalHeaders(req, new URL(u).host), redirect: 'manual' });
           retried = true; /* a retry attempt happened — tagged either way */
-          if (res2.status !== res.status) {
-            try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e) { /* ignore */ }
-            res = res2;
-          } else {
-            try { if (res2.body && res2.body.cancel) res2.body.cancel(); } catch (e) { /* ignore */ }
+          if (r2.status !== r.status) {
+            try { if (r.body && r.body.cancel) r.body.cancel(); } catch (e) { /* ignore */ }
+            return r2;
           }
+          try { if (r2.body && r2.body.cancel) r2.body.cancel(); } catch (e) { /* ignore */ }
         } catch (e2) { /* keep the original response */ }
+      }
+      return r;
+    };
+    try {
+      if (navMode) {
+        let curUrl = new URL(upUrl.toString());
+        let curMethod = method;
+        let curBody = body; /* ArrayBuffer — replayable on 307/308 redirects */
+        for (let hop = 0; hop <= CHAIN_MAX_HOPS; hop++) {
+          h.set('origin', 'https://' + curUrl.host);
+          h.set('referer', 'https://' + curUrl.host + '/');
+          /* chain-collected cookies are the freshest — mergeCookieList
+           * eats them LAST so they win over jar and browser cookies */
+          h.set('cookie', mergeCookieList([req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''], chainCookies));
+          if (curMethod === 'GET' || curMethod === 'HEAD') {
+            h.delete('content-length');
+            h.delete('content-type');
+            curBody = undefined;
+          } else if (curBody !== undefined) {
+            h.set('content-length', String(curBody.byteLength));
+          }
+          const fi = { method: curMethod, headers: h, redirect: 'manual' };
+          if (curBody !== undefined && curMethod !== 'GET' && curMethod !== 'HEAD') fi.body = curBody;
+          res = await fetch(curUrl.toString(), fi);
+          res = await hopRetry(res, curUrl.toString(), curMethod);
+          if (chainHosts.indexOf(curUrl.host) < 0) chainHosts.push(curUrl.host);
+          const st = res.status;
+          const loc2 = res.headers.get('location');
+          const isRedir = !!(loc2 && st >= 300 && st < 400 && st !== 304);
+          if (!isRedir) break; /* the chain's final answer */
+          rawSetCookies(res).forEach((sc) => { if (sc) chainCookies.push(sc); });
+          let abs = null;
+          try { abs = new URL(loc2, curUrl); } catch (eL) { abs = null; }
+          if (!abs || (abs.protocol !== 'https:' && abs.protocol !== 'http:')) break; /* unfollowable — degrade to the plain 30x path below */
+          if (hop === CHAIN_MAX_HOPS) {
+            const rh502 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            rh502.set('x-ohp-up', curUrl.toString());
+            rh502.set('x-ohp-errbody', encodeURIComponent('The sign-in flow bounced between ' + chainHosts.join(', ') +
+              ' without finishing — an SSO/identity-provider page is likely refusing the relay. Tap Retry, or sign in with a different method.'));
+            return new Response(JSON.stringify({ error: 'redirect chain too long', hosts: chainHosts }), { status: 502, headers: corsHeaders(req, rh502) });
+          }
+          if (!hostAllowed(abs.host, event)) {
+            const rh502 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            rh502.set('x-ohp-up', curUrl.toString());
+            rh502.set('x-ohp-errbody', encodeURIComponent('The sign-in flow tried to leave the relay to ' + abs.host +
+              ' — that host is not in the worker allowlist. Add it to the EXTRA_HOSTS variable (comma-separated) in this Cloudflare worker and try again.'));
+            return new Response(JSON.stringify({ error: 'redirect to unallowed host', host: abs.host, hint: 'add EXTRA_HOSTS to the worker env', visited: chainHosts }), { status: 502, headers: corsHeaders(req, rh502) });
+          }
+          if (st === 303 || ((st === 301 || st === 302) && curMethod !== 'GET' && curMethod !== 'HEAD')) {
+            curMethod = 'GET'; /* fetch semantics: POST becomes GET on 301/302/303 */
+            curBody = undefined;
+          }
+          /* 307/308 keep method + body */
+          curUrl = abs;
+        }
+        /* the chain resolved: everything downstream (HTML rewrite, JS
+         * rewrite, x-final-url, 4xx diagnostics) must describe the FINAL
+         * document, not the entry hop */
+        upUrl = curUrl;
+        host = curUrl.host;
+        if (!tokMode) pfx = prefixForHost(host, event);
+      } else {
+        const fetchInit = { method: method, headers: h, redirect: 'manual' };
+        if (body !== undefined) fetchInit.body = body;
+        if (needDuplex) fetchInit.duplex = 'half';
+        res = await fetch(upUrl.toString(), fetchInit);
+        res = await hopRetry(res, upUrl.toString(), method);
       }
     } catch (err) {
       return json({ error: 'upstream fetch failed', detail: String(err && err.message || err) }, req, 502);
     }
 
-    /* ---- redirect handling: rewrite Location and let the browser follow inside the worker ---- */
+    /* ---- redirect handling: rewrite Location and let the browser follow inside the worker ----
+     * Plain mode hands every 30x back to the caller (mapped to a worker
+     * path, cookies re-issued). Navigation chains normally never get
+     * here — the loop above already consumed them — this is the
+     * unfollowable edge (unparseable target / non-http scheme)
+     * degrading gracefully. */
     const loc = res.headers.get('location');
     if (loc && res.status >= 300 && res.status < 400 && res.status !== 304) {
       const mapped = mapLocation(loc, upUrl, event, tokMode);
       const rh = scrubHeaders(res.headers);
       reissueCookies(res, rh, event);
-      reissueRawCookies(recoveryCookies, rh); /* v6.4 recovery cookies ride along */
+      reissueRawCookies(recoveryCookies.concat(chainCookies), rh); /* v6.4 recovery + v6.10 chain cookies ride along */
       rh.set('location', mapped);
       maybeSetTokenCookie(req, rh, event);
       return new Response(null, { status: res.status, headers: corsHeaders(req, rh) });
@@ -2281,7 +2388,8 @@ async function handle(req, event) {
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const outHeaders = scrubHeaders(res.headers);
     reissueCookies(res, outHeaders, event);
-    reissueRawCookies(recoveryCookies, outHeaders); /* v6.4 recovery cookies ride along */
+    /* v6.4 recovery cookies + v6.10 the whole sign-in chain's cookies ride along */
+    reissueRawCookies(recoveryCookies.concat(chainCookies), outHeaders);
     maybeSetTokenCookie(req, outHeaders, event);
     outHeaders.set('x-final-url', res.url || upUrl.toString());
     if (retried) outHeaders.set('x-ohp-retry', (retried === 'dropauth' || retried === 'capacity') ? retried : '1');
@@ -2581,7 +2689,7 @@ function corsHeaders(req, h) {
   h.set('access-control-allow-methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
   const reqH = req.headers.get('access-control-request-headers');
   h.set('access-control-allow-headers', reqH || '*');
-  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-errbody, x-ohp-up');
+  h.set('access-control-expose-headers', 'content-disposition, content-type, location, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-errbody, x-ohp-up');
   h.set('access-control-max-age', '86400');
   return h;
 }
@@ -2600,7 +2708,7 @@ function minimalHeaders(req, host) {
   if (al) h.set('accept-language', al);
   h.set('accept', req.headers.get('accept') || '*/*');
   h.set('accept-encoding', 'gzip, deflate, br');
-  const ck = mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || '');
+  const ck = mergeCookies(req.headers.get('x-cookie') || '', req.headers.get('cookie') || ''); /* v6.10: jar wins, browser fills gaps */
   if (ck) h.set('cookie', ck);
   h.set('origin', 'https://' + host);
   h.set('referer', 'https://' + host + '/');
@@ -3085,7 +3193,7 @@ async function proxyWebsocket(req, url, event) {
     if (t.searchParams.has('__t')) t.searchParams.delete('__t');
 
     const upHeaders = new Headers({ 'Upgrade': 'websocket' });
-    const ck = mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || '');
+    const ck = mergeCookies(req.headers.get('x-cookie') || '', req.headers.get('cookie') || ''); /* v6.10: jar wins, browser fills gaps */
     if (ck) upHeaders.set('cookie', ck);
     upHeaders.set('origin', 'https://' + t.host);
 
