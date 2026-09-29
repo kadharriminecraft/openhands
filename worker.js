@@ -1,160 +1,187 @@
+/* ================================================================
+   ================================================================
+    OWNER KEY — OPTIONAL. THIS IS THE ONLY SETTING IN THIS FILE.
+   ================================================================
+   Leave it EMPTY (easiest, recommended): the relay locks itself
+   to the first OpenHands Cloud account that signs in on it — you
+   stay signed in, and strangers who only have your relay address
+   get a plain guest proxy. Nothing to configure, nothing to type.
+
+   WANT IT FULLY PRIVATE INSTEAD? Put your secret between the
+   quotes on the OWNER_KEY line just below, then Save & Deploy:
+
+        const OWNER_KEY = "my-secret-key";
+
+   With a key set, the relay is YOURS ALONE: every feature — the
+   app, the session, everything — answers ONLY to apps that type
+   the same key once (the OWNER_KEY box on the pocket's main page
+   — tap the ? next to it for help). Anyone else holding your
+   relay address gets one honest "locked" answer and nothing at
+   all: no app, no proxying, no session.
+   ================================================================ */
+const OWNER_KEY = "";
+
 /* ============================================================
- * OpenHands pocket — Cloudflare Worker relay — openhands-worker.js
- * BUILD: ohp service 1.3 (adds v6.11: hop-trace diagnostics — every
- *   navigation-chain response carries x-ohp-hops, the full
- *   status+URL of every upstream hop, and the pocket's error card
- *   renders the chain, so a failed sign-in names the exact failing
- *   hop; 404 joined the per-hop minimal-header retry set — GitHub's
- *   authorize endpoint occasionally answers a plain-text 404 "Not
- *   Found" to worker egress (bot mitigation) and one clean retry
- *   rescues the chain; the neutral 404 identifies as service "ohp"
- *   and carries x-ohp-up/x-ohp-errbody; the error card prefers the
- *   worker's own hop account over the sandbox's pre-flight guess.
- *   Keeps v6.10 chain cookie folding + v6.9 form.submit() + errbody
- *   diagnostics.)
+ * OpenHands pocket — Cloudflare Worker relay — worker.js
+ * BUILD: ohp service 1.0 (the current one-and-only build)
  *   Deploy check: /__status on the worker URL must answer
- *   "ohp service 1.3" — anything else means an old copy is
- *   still deployed; replace it with this file.
+ *   "ohp service 1.0" — anything older is a stale copy.
  * ------------------------------------------------------------
- * WHAT THIS DOES — the "no-navigation" architecture, ported
- *   from the zaihtml project's zp worker to OpenHands:
- *   The phone's browser NEVER opens this worker as a web page.
- *   The saved pocket file (openhands-pocket.html) is the app
- *   shell: it FETCHES every document, script, stylesheet and
- *   API call of the REAL OpenHands website (app.all-hands.dev)
- *   through this worker with plain CORS fetch() — nothing ever
- *   navigates to the worker origin — and paints the ACTUAL
- *   website inside a locked null-origin sandbox frame in the
- *   file itself. Same concept, same architecture as the original
- *   pocket project; zero z.ai involvement — every byte flows to
- *   app.all-hands.dev (OpenHands cloud) only.
+ * WHAT THIS DOES
+ *   A faithful port of the z.ai pocket relay architecture
+ *   ("zp service 7.4") to OpenHands Cloud (app.all-hands.dev):
  *
- *   Because it is the REAL OpenHands app running through the
- *   relay, everything the official website offers works:
- *   conversations with the cloud AI agent, GitHub management,
- *   file/workspace management, settings — and conversations
- *   keep running on the OpenHands cloud while the file is
- *   closed; reopen the file any time and the app reconnects
- *   and shows exactly where the AI is.
+ *   - The phone's browser NEVER opens this worker as a web page.
+ *     The saved pocket file (PocketOpenHands.html) is the app
+ *     shell: it FETCHES every document, script, stylesheet and
+ *     API call through this worker with plain CORS fetch() —
+ *     nothing ever navigates to the worker origin — and paints
+ *     the app inside a locked null-origin sandbox frame in the
+ *     file itself. Organization web filters intercept
+ *     NAVIGATIONS (that is the "blocked by your organization"
+ *     page); fetch() calls from a saved local file sail past
+ *     them.
+ *   - The worker's own root serves only a small neutral status
+ *     page — never OpenHands content — so the hostname can never
+ *     be content-classified as an AI-agent site, and every
+ *     upstream URL stays an opaque /__t/<token>.
+ *   - SESSION: the relay passively captures the live OpenHands
+ *     Cloud sign-in (cookie jar + any Bearer API key + the
+ *     {user_id, email, role} identity of the
+ *     /api/organizations/{id}/me answers) into one edge-cache
+ *     slot (/__session). The pocket pulls it before the first
+ *     document load, so the app boots already signed in — on
+ *     ANY phone, no matter what its viewer does to storage.
+ *   - KEEP THE SESSION OPEN (the OpenHands addition): OpenHands
+ *     Cloud agents run SERVER-SIDE — they keep working in the
+ *     cloud after you close the pocket file. The sign-in is the
+ *     only thing that can die while you are away, so a cron
+ *     trigger (wrangler.toml) calls cloudTick() every 5
+ *     minutes: while you are away it refreshes the held session
+ *     and records a compact snapshot of your conversations
+ *     (running / finished / errored + latest titles) that the
+ *     pocket's "Cloud agents" card shows the moment you open
+ *     the file again. Close the file, come back, projects done.
  *
- *   On top of that, the worker's own root serves only a small
- *   neutral status page — never OpenHands content — and every
- *   upstream URL stays an opaque /__t/<token> or /__o/<token>
- *   handle, so no readable upstream hostname ever appears in a
- *   request the phone makes.
+ * LINEAGE (the z.ai relay this architecture comes from — every
+ *   mechanism below is the same, retargeted):
+ *   v3 — Cloudflare-edge headers dropped before forwarding, the
+ *        one-shot 403/429 clean retry, /__diag.
+ *   v4 — opaque tokens for every cross-host URL: no readable
+ *        upstream hostname in any request the phone makes.
+ *   v5 — sandbox-first serving: neutral root, cfg.sd sandbox
+ *        mode, the fake location object (__ohLoc), the
+ *        /__status "entry" boot handle.
+ *   v6 — credentialed CORS, path-preserving /__o/ handles +
+ *        injected <base>, the cookie jar relayed via
+ *        x-set-cookie / x-cookie, SSE passthrough hardening.
+ *   v6.9/7.0 — the relay-held sticky session; only an explicit
+ *        sign-out forgets it.
+ *   v7.1/7.4 — the OWNER_KEY gate and the full lock; keyed
+ *        token space, honest stale status.
+ *   v7.2 — AUTO mode: the relay locks itself to the first
+ *        account that signs in; a minted slot key rides home on
+ *        x-ohp-claim; a wiped phone just signs in again and the
+ *        key re-issues automatically.
  *
- * PORT NOTES (original zaihtml architecture -> OpenHands)
- *   - upstream family: all-hands.dev (app, docs, * runtime
- *     hosts) plus the GitHub sign-in hosts (OAuth), GitHub
- *     avatars/assets, Google webfonts and the posthog
- *     analytics endpoints the OpenHands CSP names.
- *   - OpenHands is a Vite SPA whose build emits ROOT-ABSOLUTE
- *     module specifiers ("/assets/chunk.js") in its boot HTML
- *     and its served module files. Those are re-pointed at
- *     /__o/ handles (rewriteJsImports) — otherwise they would
- *     resolve against the worker root and die on a neutral 404.
- *   - original-site-only machinery (captcha scene logic, session
- *     recovery, capacity auto-retry, delivery-host quirks) is
- *     REMOVED: OpenHands has no equivalents.
- *     The generic machinery (opaque tokens, sandbox runtime,
- *     cookie jar, SSE hardening, websocket proxy, session
- *     vault, PROXY_TOKEN gate) is kept intact.
- *
- * DEPLOY (you already have a worker)
- *   1. dash.cloudflare.com -> Workers & Pages -> your worker
- *   2. "Edit code" / Quick Edit -> select all -> paste this file
- *   3. Save & Deploy
- *   4. (optional) Settings -> Variables -> PROXY_TOKEN with a
- *      long random string, and/or EXTRA_HOSTS="a.com,b.com" to
- *      allowlist more first-party hosts.
- *   5. Save openhands-pocket.html on the phone, paste your
- *      worker address into "Your relay" on first open (or bake
- *      it into BAKED_URL inside the file), and use its "Open
- *      OpenHands (sandboxed)" button — the real app streams
- *      into the file through this worker. Do NOT open the
- *      worker URL in the browser; it is only a relay.
+ * DEPLOY (fresh)
+ *   1. dash.cloudflare.com → Workers & Pages → Create
+ *   2. Paste this file → Deploy (the free plan is fine; the
+ *      cron trigger below works on the free plan too)
+ *   3. NOTHING — no variables needed. Open the pocket file,
+ *      point it at the worker, sign in once; the relay locks to
+ *      that account and stays signed in. Optional: OWNER_KEY at
+ *      the very top of this file for strict keyed mode;
+ *      APP_UPSTREAM to target a different OpenHands instance;
+ *      PROXY_TOKEN for a shared-secret gate; EXTRA_HOSTS to
+ *      allowlist more hosts.
+ *   4. Save PocketOpenHands.html on the phone and use its
+ *      "Open OpenHands Cloud" button — the app streams into the
+ *      file through this worker. Do NOT open the worker URL in
+ *      the browser; it is only a relay.
  *
  * ROUTES
  *   /            -> neutral service page (token setup form when
- *                   PROXY_TOKEN is set). NEVER OpenHands content.
+ *                   PROXY_TOKEN is set). NEVER app content.
  *   /__t/<token> -> https://<upstream-url>   the ONLY content
  *                   route: opaque token = absolute upstream URL
  *                   XOR-encrypted + base64url'd. CORS-open for
- *                   every origin (the pocket file fetches it),
- *                   every method, cookies relayed via x-set-cookie
- *                   + x-cookie, final URL reported as x-final-url.
- *                   With the request header x-ohp-nav: 1 (the pocket's
- *                   document loader) the worker walks the upstream 30x
- *                   chain itself, folding every hop's Set-Cookie into
- *                   the next hop and re-issuing the union on the final
- *                   response (v6.10 — sign-in chains survive browsers
- *                   that cannot store this origin's cookies at all).
- *   /__o/<token><path> -> path-preserving origin token (v6
- *                   form): keeps relative URL resolution working
- *                   for dynamic import() and css url().
- *   /__status    -> health-check JSON + "entry" (the tokenized
- *                   root document path — the pocket file's app
- *                   boot handle). Neutral: no OpenHands strings.
- *   /__diag      -> live upstream probe report (three probes,
- *                   plain-English verdict).
- *   /__vault     -> the session vault. GET/POST/DELETE with
- *                   header x-vault-pin (6+ chars). Stores one
- *                   small encrypted JSON blob per secret in the
- *                   edge cache; nothing else, no plaintext ever.
+ *                   every origin, every method, cookies relayed
+ *                   via x-set-cookie + x-cookie, final URL
+ *                   reported as x-final-url.
+ *   /__status    -> health-check JSON + "entry" (tokenized root
+ *                   document path) + cloud:true (cron keep-alive).
+ *   /__diag      -> live upstream probe report.
+ *   /__session   -> the relay-held session. GET returns {ok,has,
+ *                   savedAt,token,role,id,email,name,jar,cloud,
+ *                   stale} — cloud is the keep-alive snapshot
+ *                   (running/finished counts + latest titles).
+ *                   DELETE forgets it AND fires the upstream
+ *                   logout (a real sign-out).
  *   /__clear     -> expire session cookies, back to /
  *   /favicon.ico -> 204 (neutral — never a proxied page)
- *   /p/<host>/*  -> legacy form, still accepted for stale
- *                   caches, never emitted.
- *   anything else (bare path) -> neutral 404 JSON. The phone
- *                   never navigates here, so it serves nothing.
+ *   /p/<host>/*  -> legacy form, still accepted, never emitted.
+ *   anything else (bare path) -> neutral 404 JSON.
+ *   cron trigger -> cloudTick() every 5 minutes: refresh the held
+ *                   session and poll the conversation list while
+ *                   you are away — "keep the session open".
  *
  * SECURITY
- *   - Only the OpenHands / GitHub sign-in / font / analytics
- *     family hosts are proxied. This is NOT an open proxy.
+ *   - Only the OpenHands Cloud family (all-hands.dev,
+ *     openhands.dev), the sign-in/analytics hosts the app needs
+ *     (github.com, google.com, posthog.com) and EXTRA_HOSTS are
+ *     proxied. This is NOT an open proxy.
  *   - With PROXY_TOKEN set, everything except the token page,
  *     /__status and /__diag requires the token.
  *   - Upstream set-cookies are relayed to the sandbox runtime via
  *     the CORS-exposed x-set-cookie header; the runtime replays
- *     them as x-cookie. Nothing is stored at this origin.
+ *     them as x-cookie. Nothing is stored at this origin except
+ *     the ONE /__session slot: it holds the captured live session
+ *     so the user's own pocket file re-signs itself in. This
+ *     relay is single-user by design — if the worker URL ever
+ *     leaks, DELETE /__session (or just sign out in the app)
+ *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.3';
+const VERSION = 'ohp service 1.0';
 
-/* OpenHands first-party family (suffix match — covers subdomains).
- * all-hands.dev covers app.all-hands.dev (the app + its API),
- * auth.app.all-hands.dev (the Keycloak sign-in) and any other
- * *.all-hands.dev runtime hosts the app connects to at run time.
- * The IdP hosts carry the "Log in with GitHub / GitLab / Bitbucket"
- * flows (their OAuth consent + login pages are relayed through the
- * sandbox exactly like the app). fonts/posthog are the remaining
- * hosts the OpenHands CSP itself names. */
+/* OpenHands Cloud family + the hosts its sign-in needs (suffix
+ * match — covers every subdomain: runtime sandboxes, CDN, auth). */
 const ALLOW = [
-  'all-hands.dev',       // app.all-hands.dev + auth.app.all-hands.dev (Keycloak) + runtime hosts
-  'github.com',          // GitHub OAuth sign-in pages
-  'githubusercontent.com', // avatars.githubusercontent.com, raw content
-  'githubassets.com',    // GitHub's asset cdn
-  'gitlab.com',          // GitLab OAuth sign-in pages
-  'gitlab-static.net',   // GitLab's asset cdn
-  'bitbucket.org',       // Bitbucket OAuth sign-in pages
-  'atlassian.net',       // cdn.atlassian.net (Bitbucket assets)
-  'fonts.googleapis.com', // webfonts the app styles reference
-  'fonts.gstatic.com',
-  'posthog.com',         // us.i.posthog.com / us-assets.i.posthog.com analytics
+  'all-hands.dev',      // app.all-hands.dev (the cloud app + API), www, runtime sandboxes
+  'openhands.dev',      // the newer OpenHands domain family (app + sandboxes)
+  'github.com',         // the GitHub sign-in / OAuth flow the login page sends you to
+  'google.com',         // reCAPTCHA Enterprise on the sign-in page (www.google.com)
+  'posthog.com',        // product analytics the app loads at boot (opt-in)
 ];
 
 /* ---- v4: opaque request tokens ----------------------------------------
  * Every upstream URL this worker embeds in a response (attr values,
  * css url()s, redirect Locations) and every cross-host URL the
  * runtime patch maps in the browser is XOR-obfuscated + base64url'd
- * as /__t/<token> so NO upstream hostname (the app family,
- * IdP hosts …) is ever readable in a request the phone makes.
+ * as /__t/<token> so NO upstream hostname (z.ai, chatglm.cn,
+ * alicdn …) is ever readable in a request the phone makes.
  * Organization content filters decode query strings and paths and
  * category-block those hosts even though the request already flows
  * through this worker — opaque tokens end that. The key is shared
- * with the runtime patch via window.__OHP__.key (build asserts the
+ * with the runtime patch via window.__OH__.key (build asserts the
  * template carries exactly one TOK_KEY definition). ?url= is NOT
  * accepted: tokens are the only way in. */
-const TOK_KEY = 'ohwtok-1-0-0-OhRy9kPz';
+const TOK_KEY_BASE = 'ohwtok-1-0-0-Hx9qT4mV';
+/* v7.4: keyed relays re-key the whole token space with a mask
+ * derived from the OWNER_KEY (never the key itself — the mask rides
+ * to the client as __OH__.key exactly like TOK_KEY always has, and
+ * only keyed requests ever receive a document carrying it). Every
+ * token minted BEFORE a key was set stops decoding, so held entry /
+ * subresource tokens are not a way around the full lock. The runtime
+ * patch mints with the same masked key, so everything stays in sync. */
+function fnvKeyMask(s) {
+  let h = 0x811c9dc5;
+  const b = new TextEncoder().encode(String(s || ''));
+  for (let i = 0; i < b.length; i++) { h ^= b[i]; h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0; }
+  return h.toString(16) + '-' + b.length.toString(16);
+}
+const TOK_KEY = OWNER_KEY ? (TOK_KEY_BASE + '.' + fnvKeyMask(OWNER_KEY)) : TOK_KEY_BASE;
 
 function encTok(u) {
   const bytes = new TextEncoder().encode(String(u));
@@ -193,7 +220,7 @@ function oTokPath(absUrl) {
   } catch (e) { return null; }
 }
 
-/* upstream origin for the /chat route (env APP_UPSTREAM overrides, e.g. for staging) */
+/* upstream origin of the OpenHands Cloud app (env APP_UPSTREAM overrides) */
 function appUpstream(event) { return envOf(event).APP_UPSTREAM || 'https://app.all-hands.dev'; }
 function appHost(event) {
   try { return new URL(appUpstream(event)).host; } catch (e) { return 'app.all-hands.dev'; }
@@ -202,7 +229,7 @@ function appHost(event) {
 /* markers filled by the build script */
 const PATCH_JS = [
 "/* ============================================================",
-" * OpenHands pocket \u2014 runtime patch (v1)",
+" * z.ai pocket \u2014 runtime patch (v4)",
 " * Injected by the proxy worker into every proxied HTML document",
 " * as the FIRST script inside <head>. It rewrites every network",
 " * call, navigation and popup so the SPA believes it lives on its",
@@ -210,10 +237,10 @@ const PATCH_JS = [
 " *",
 " * v4 \u2014 OPAQUE TOKENS: every cross-host URL mapped here becomes",
 " * /__t/<gibberish> (the absolute upstream URL XOR-encrypted +",
-" * base64url'd with the key the worker injected as __OHP__.key).",
+" * base64url'd with the key the worker injected as __OH__.key).",
 " * NO request the browser makes carries a readable upstream",
 " * hostname \u2014 organization content filters read URLs and",
-" * category-block app.all-hands.dev / github hosts, which is what",
+" * category-block z.ai / chatglm / alicdn hosts, which is what",
 " * killed the /p/<host>/\u2026 form this patch used to emit.",
 " *",
 " * NOTE: this source is embedded inside a <script> tag in proxied",
@@ -222,14 +249,19 @@ const PATCH_JS = [
 " * ============================================================ */",
 "(function () {",
 "  'use strict';",
-"  if (window.__OHP_PATCHED__) return;",
-"  window.__OHP_PATCHED__ = true;",
+"  if (window.__OH_PATCHED__) return;",
+"  window.__OH_PATCHED__ = true;",
 "",
-"  var CFG = window.__OHP__ || {};",
+"  var CFG = window.__OH__ || {};",
 "  var PFX = CFG.pfx || '';            // proxy prefix for this document, '' = transparent root",
 "  var HOST = (CFG.host || '').toLowerCase(); // upstream host this document belongs to",
 "  var WORKER = CFG.worker || '';      // worker origin, e.g. https://name.workers.dev",
 "  var TOKEN = CFG.token || '';        // optional shared proxy token",
+"  var OKEY = '';                       // v7.1: the owner key the shell\n" +
+"                                      // stamps into the boot (frame.name)\n" +
+"                                      // and refreshes via 'init' — rides as\n" +
+"                                      // x-ohp-owner on WORKER-destination\n" +
+"                                      // requests only, never to a 3rd party",
 "  var ALLOW = CFG.allow || [];        // allowlisted host suffixes",
 "  var KEY = CFG.key || '';            // v4 opaque-token key (shared with the worker)",
 "  var TOK = !!CFG.tok;                // true when this doc was served through /__t/<token>",
@@ -290,14 +322,14 @@ const PATCH_JS = [
 "  /* ---------- v5: fake location (window.__ohLoc) ---------------------",
 "   * The worker's JS pass rewrites location.<prop> tokens in served",
 "   * scripts to __ohLoc.<prop>. Reads answer the REAL upstream URL",
-"   * (SPA routers hydrate as if the page lived on its real origin); the href",
+"   * (SPA routers hydrate as if the page lived at chat.z.ai); the href",
 "   * setter (and assign/replace/reload) turn navigations into nav()",
 "   * postMessages instead of steering the sandbox frame anywhere.",
 "   * v6: the underlying URL is MUTABLE \u2014 the pushState/replaceState",
 "   * shims advance it (below) so a router that re-reads",
 "   * window.location.pathname after an SPA transition sees the NEW",
 "   * path, exactly like the real location object. A frozen fake was why",
-"   * the SPA rendered the HOME view: the URL bar moved but the",
+"   * chat.z.ai/auth rendered the HOME view: the URL bar moved but the",
 "   * router's own re-resolution still read \"/\". */",
 "  var LOC = { u: null };",
 "  try { LOC.u = DOC ? new URL(DOC) : null; } catch (eLoc0) { LOC.u = null; }",
@@ -345,89 +377,24 @@ const PATCH_JS = [
 "        });",
 "      });",
 "    } catch (eD) { /* ignore */ }",
-"  /* ---------- v1 (OpenHands): URL-constructor healing ----------------",
-"   * React Router's createURL builds new URL(path, base) with base =",
-"   * window.location.origin — captured through a VARIABLE (e.location),",
-"   * so no textual rewrite can reach it. In the null-origin sandbox the",
-"   * real location answers origin \"null\" (opaque origin) and href",
-"   * \"about:srcdoc\", and new URL(path, \"about:srcdoc\") throws",
-"   * \"TypeError: Invalid URL\", killing the whole app at boot. Heal it",
-"   * here: any base that cannot parse (\"null\", \"about:…\", \"\", an",
-"   * opaque-origin Location, a plain object) is replaced with DOC — the",
-"   * document's real upstream URL — so URL resolution lands on the app's",
-"   * true origin exactly as on the real site. */",
-"  try {",
-"    if (SD) {",
-"      var _URL = window.URL;",
-"      function badBase(b) {",
-"        if (b === undefined || b === null) return false;",
-"        var s = '';",
-"        try { s = String(typeof b === 'string' ? b : (b.href !== undefined ? b.href : String(b))); } catch (eS) { s = String(b); }",
-"        s = String(s).trim();",
-"        if (!s || s === 'null' || s === 'undefined') return true;",
-"        if (/^about:/i.test(s)) return true;",
-"        try { new _URL('http://x/', s); return false; } catch (eP) { return true; }",
-"      }",
-"      function HealURL(url, base) {",
-"        if (arguments.length >= 2) {",
-"          if (badBase(base)) base = DOC;",
-"          return new _URL(url, base);",
-"        }",
-"        return new _URL(url);",
-"      }",
-"      try { HealURL.prototype = _URL.prototype; } catch (ePr) { /* ignore */ }",
-"      try { HealURL.createObjectURL = _URL.createObjectURL; } catch (eCU) { /* ignore */ }",
-"      try { HealURL.revokeObjectURL = _URL.revokeObjectURL; } catch (eRU) { /* ignore */ }",
-"      window.URL = HealURL;",
-"    }",
-"  } catch (eURL) { /* ignore */ }",
-"  /* ---------- v1 (OpenHands): document.defaultView proxy ----------------",
-"   * THE ROUTER HOOK. React Router v7's createBrowserHistory() is called",
-"   * with NO window option: it grabs document.defaultView and reads",
-"   * defaultView.location — through a VARIABLE, so no textual rewrite in",
-"   * any served script can ever reach it. In the srcdoc sandbox that is",
-"   * the real about:srcdoc location (pathname \"srcdoc\") and the router",
-"   * hydrates against it — no route matches, the app dies on its 404",
-"   * view before painting anything. Fix it at the seam: defaultView now",
-"   * returns a Proxy of the REAL window whose .location is __ohLoc (the",
-"   * fake upstream location, pathname \"/\"). Everything else forwards",
-"   * untouched — history, addEventListener, getComputedStyle — with",
-"   * functions bound to the real window so host methods never see a",
-"   * foreign receiver. The router now hydrates exactly as it does on the",
-"   * real site, and every URL it creates resolves against the real",
-"   * upstream origin. */",
-"  try {",
-"    if (SD && window.__ohLoc) {",
-"      var fakeWin = new Proxy(window, {",
-"        get: function (t, p, r) {",
-"          try {",
-"            if (p === 'location') return window.__ohLoc;",
-"            var v = t[p];",
-"            if (typeof v === 'function') { try { return v.bind(t); } catch (eB) { return v; } }",
-"            return v;",
-"          } catch (eG) { return undefined; }",
-"        },",
-"        set: function (t, p, v) { try { t[p] = v; return true; } catch (eS2) { return false; } },",
-"        has: function (t, p) { try { return p in t; } catch (eH2) { return false; } }",
-"      });",
-"      Object.defineProperty(Document.prototype, 'defaultView', {",
-"        get: function () { return fakeWin; },",
-"        configurable: true",
-"      });",
-"    }",
-"  } catch (eDV) { /* ignore */ }",
-
 "  }",
 "",
-"  /* ---------- v5: window.name boot hydration --------------------------",
-"   * The shell stamps the frame's name with a snapshot {ohp:1, ls, jar}",
-"   * BEFORE assigning the srcdoc \u2014 it is readable synchronously here,",
-"   * so the app's own scripts (which run after this patch) find their",
-"   * session cookies and localStorage already populated. No race. */",
+"  /* ---------- v5/v7.4: boot hydration ----------------------------------",
+"   * The shell stamps the frame's name with a snapshot {zp:1, ls, jar}",
+"   * BEFORE assigning the srcdoc \u2014 and v7.4 additionally injects the",
+"   * same snapshot as a REAL <script> at the very top of the document",
+"   * (window.__OH_SEED__), because Chrome never copies window.name into",
+"   * a null-origin sandbox frame (verified live: name=EMPTY inside the",
+"   * srcdoc even after the shell stamped the frame name). Whichever way",
+"   * the snapshot arrives it is readable synchronously here, so the",
+"   * app's own scripts (which run after this patch) find their session",
+"   * cookies and localStorage already populated. No race. */",
 "  try {",
-"    if (SD && window.name) {",
-"      var boot = JSON.parse(window.name);",
-"      if (boot && boot.ohp === 1) {",
+"    var boot = null;",
+"    try { if (window.__OH_SEED__ && window.__OH_SEED__.zp === 1) boot = window.__OH_SEED__; } catch (eSS) { boot = null; }",
+"    if (!boot && SD && window.name) { try { boot = JSON.parse(window.name); } catch (eSN) { boot = null; } }",
+"    if (boot && boot.zp === 1) {",
+"        if (typeof boot.ok === 'string' && boot.ok) OKEY = boot.ok; /* v7.1 */",
 "        if (boot.ls && typeof boot.ls === 'object') {",
 "          Object.keys(boot.ls).forEach(function (k) { if (!(k in lsMirror)) lsMirror[k] = String(boot.ls[k]); });",
 "        }",
@@ -438,7 +405,6 @@ const PATCH_JS = [
 "          jar = Object.keys(jarMap).map(function (k) { return jarMap[k]; });",
 "        }",
 "      }",
-"    }",
 "  } catch (eN) { /* ignore */ }",
 "",
 "  /* ---------- messaging ---------- */",
@@ -733,10 +699,24 @@ const PATCH_JS = [
 "    }",
 "  } catch (eCookieShim) { /* ignore */ }",
 "",
-"  /* ---------- header injection ---------- */",
-"  function applyHeaders(h) {",
+"  /* ---------- v7.1: is this destination the WORKER? --------------------",
+"   * The owner key rides ONLY on requests the relay itself will see\n" +
+"   * (worker-origin URLs, or relative paths that resolve onto the\n" +
+"   * worker via <base>/same-origin). A beacon or asset fetched\n" +
+"   * DIRECTLY from a third-party host never sees the key. */",
+"  function workerDest(u) {",
 "    try {",
-"      /* v6.4: ALWAYS refresh x-cookie with the current jar. The app",
+"      var s = String(u || '');",
+"      if (!s) return false;",
+"      if (/^https?:\\/\\//i.test(s)) return isWorkerUrl(s);",
+"      return s.charAt(0) === '/';",
+"    } catch (e) { return false; }",
+"  }",
+"",
+"  /* ---------- header injection ---------- */",
+"  function applyHeaders(h, ours) {",
+"    try {",
+"      /* v6.4: ALWAYS refresh x-cookie with the current jar. The z.ai",
 "       * boot script shares ONE headers object across its auths / config /",
 "       * models / settings fetches; v6.3's skip-if-present kept the FIRST",
 "       * call's cookie snapshot baked into that shared object, so /api/models",
@@ -748,6 +728,10 @@ const PATCH_JS = [
 "      if (ch) h.set('x-cookie', ch);",
 "      else { try { h.delete('x-cookie'); } catch (eDel) { /* ignore */ } }",
 "      if (TOKEN && !h.has('x-proxy-token')) h.set('x-proxy-token', TOKEN);",
+"      /* v7.1: the owner key rides on WORKER-destination requests only",
+"       * (ours === true) — the relay uses it to gate capture / sticky",
+"       * / recovery, and it is stripped before anything goes upstream. */",
+"      if (OKEY && ours) { try { h.set('x-ohp-owner', OKEY); } catch (eOK) { /* ignore */ } }",
 "    } catch (e) { /* ignore */ }",
 "    return h;",
 "  }",
@@ -806,7 +790,7 @@ const PATCH_JS = [
 "            try { input.headers.forEach(function (v, k) { H.set(k, v); }); } catch (eIH) { /* ignore */ }",
 "          } else { H = new Headers(); }",
 "        } catch (e3) { H = new Headers(); }",
-"        init.headers = applyHeaders(H);",
+"        init.headers = applyHeaders(H, workerDest((typeof input === 'string') ? input : (input && input.url) || ''));",
 "        var iu = '';",
 "        try { iu = (typeof input === 'string') ? input : (input && typeof input.url === 'string') ? input.url : ''; } catch (eIU) { iu = ''; }",
 "        var meth = 'GET';",
@@ -849,7 +833,7 @@ const PATCH_JS = [
 "                try {",
 "                  if (r2 && r2.ok) {",
 "                    try { ingestSetCookie(r2.headers && r2.headers.get('x-set-cookie')); } catch (e5) { /* ignore */ }",
-"                    if (/\\/api\\/(models|v1\\/auths)/.test(String(iu))) {",
+"                    if (/\\/api\\//.test(String(iu))) {",
 "                      try { localStorage.removeItem('token'); } catch (eL) { /* ignore */ }",
 "                      try { up({ type: 'ls', store: 'localStorage', k: 'token', v: null }); } catch (eU) { /* ignore */ }",
 "                    }",
@@ -863,11 +847,11 @@ const PATCH_JS = [
 "        }, function (err) {",
 "          /* network-level failure: one delayed retry for GET api calls */",
 "          try {",
-"            if (SD && isApiGet && !init.__ohpR) {",
+"            if (SD && isApiGet && !init.__zpR) {",
 "              return new Promise(function (res2, rej2) {",
 "                setTimeout(function () {",
 "                  var i3 = retryable(init);",
-"                  i3.__ohpR = 1;",
+"                  i3.__zpR = 1;",
 "                  _fetch(iu, i3).then(res2, rej2);",
 "                }, 350);",
 "              });",
@@ -877,13 +861,21 @@ const PATCH_JS = [
 "        });",
 "        pr.then(function (r) {",
 "          try { ingestSetCookie(r.headers && r.headers.get('x-set-cookie')); } catch (e4) { /* ignore */ }",
+"          /* v7.2: this relay just locked itself to the account that",
+"           * signed in (or re-issued its key to a returning device) —",
+"           * hand the key to the SHELL, which saves it next to the",
+"           * relay address and rides it on every later request. */",
+"          try {",
+"            var ckK = r.headers && r.headers.get('x-ohp-claim');",
+"            if (ckK) up({ type: 'claim', key: String(ckK) });",
+"          } catch (eCK) { /* ignore */ }",
 "          /* v6.4: the worker's session recovery healed this call by",
 "           * dropping a stale Bearer (x-ohp-retry: dropauth) — clear the",
 "           * matching stale token from localStorage so the NEXT boot is",
 "           * clean instead of paying the recovery on every api call. */",
 "          try {",
 "            if (SD && r.headers && r.headers.get('x-ohp-retry') === 'dropauth' &&",
-"                /\\/api\\/(models|v1\\/auths)/.test(String(iu))) {",
+"                /\\/api\\//.test(String(iu))) {",
 "              try { localStorage.removeItem('token'); } catch (eL4) { /* ignore */ }",
 "              try { up({ type: 'ls', store: 'localStorage', k: 'token', v: null }); } catch (eU4) { /* ignore */ }",
 "            }",
@@ -902,6 +894,7 @@ const PATCH_JS = [
 "    XMLHttpRequest.prototype.open = function (method, url) {",
 "      try {",
 "        var mu = mapUrl(String(url));",
+"        this.__zpDst = (mu !== String(url)) ? absW(mu) : String(url); /* v7.1: remember the destination */",
 "        if (mu !== String(url)) {",
 "          mu = absW(mu);",
 "          if (arguments.length > 2) {",
@@ -923,11 +916,16 @@ const PATCH_JS = [
 "        var ch = cookieHeader();",
 "        if (ch) this.setRequestHeader('x-cookie', ch);",
 "        if (TOKEN) this.setRequestHeader('x-proxy-token', TOKEN);",
+"        if (OKEY && workerDest(this.__zpDst)) { try { this.setRequestHeader('x-ohp-owner', OKEY); } catch (eOK) { /* ignore */ } } /* v7.1 */",
 "      } catch (e) { /* ignore */ }",
 "      var xhr = this;",
 "      try {",
 "        xhr.addEventListener('loadend', function () {",
 "          try { ingestSetCookie(xhr.getResponseHeader && xhr.getResponseHeader('x-set-cookie')); } catch (e2) { /* ignore */ }",
+"          try {",
+"            var ckX = xhr.getResponseHeader && xhr.getResponseHeader('x-ohp-claim');",
+"            if (ckX) up({ type: 'claim', key: String(ckX) });",
+"          } catch (eCX) { /* ignore */ }",
 "        });",
 "      } catch (e3) { /* ignore */ }",
 "      return _send.apply(this, arguments);",
@@ -1129,7 +1127,7 @@ const PATCH_JS = [
 "          }",
 "          var mapped = mapUrl(dest);",
 "          if (mapped !== dest) {",
-"            // app-family absolute URL \u2192 swap for the proxied path",
+"            // z.ai-family absolute URL \u2192 swap for the proxied path",
 "            e.preventDefault();",
 "            location.href = mapped;",
 "            return;",
@@ -1181,6 +1179,77 @@ const PATCH_JS = [
 "      return stubWindow();",
 "    } catch (e) { return stubWindow(); }",
 "  };",
+"",
+"  /* ---------- v7.3: the download bridge --------------------------------",
+"   * An <a download> click inside the locked sandbox can never rely on",
+"   * the frame's own download plumbing - mobile webviews and null-origin",
+"   * iframes kill it, and the app then reports \"Download failed\". So",
+"   * the click is swallowed here, the bytes are fetched THROUGH the",
+"   * relay (jar + owner key ride exactly like on every other call), and",
+"   * the finished Blob is handed to the pocket shell, which saves it",
+"   * from the file:// page with the phone's native save flow. Covers",
+"   * blob:, data: and any relay-mappable http(s) destination; a plain",
+"   * navigation that answers content-disposition: attachment is caught",
+"   * by the shell's loader sniff instead. */",
+"  function dlNameFrom(u, mime) {",
+"    try {",
+"      var s = String(u || '');",
+"      var m = s.match(/[/?#]([^/?#]+)(?:[?#].*)?$/);",
+"      var n = m ? m[1] : '';",
+"      try { n = decodeURIComponent(n); } catch (eDC) { /* keep raw */ }",
+"      if (n && /\\.[a-z0-9]{1,8}$/i.test(n)) return n;",
+"      var ext = (String(mime || '').split('/')[1] || '').split(';')[0];",
+"      return (n || 'download') + (ext ? '.' + ext : '');",
+"    } catch (e) { return 'download'; }",
+"  }",
+"  function bridgeDownload(href, name) {",
+"    var url = String(href || '');",
+"    var nm = String(name || '').trim();",
+"    if (nm === 'true' || nm === 'false') nm = '';",
+"    var dest = url;",
+"    try { if (!/^(data|blob):/i.test(url)) dest = mapUrl(url); } catch (eM) { dest = url; }",
+"    up({ type: 'dlbegin', name: nm || dlNameFrom(url, '') });",
+"    try {",
+"      window.fetch(dest).then(function (r) {",
+"        if (!r || !r.ok) throw new Error('HTTP ' + (r && r.status));",
+"        var cdf = '';",
+"        try {",
+"          var cd = r.headers.get('content-disposition') || '';",
+"          var mm = cd.match(/filename[*]?=((?:\"([^\"]+)\")|([^;\\s]+))/i) || [];",
+"          cdf = (mm[2] || mm[3] || '').replace(/^UTF-8''/i, '');",
+"          try { cdf = decodeURIComponent(cdf); } catch (eD2) { /* keep raw */ }",
+"        } catch (eH) { /* ignore */ }",
+"        return r.blob().then(function (b) {",
+"          up({ type: 'dl', name: nm || cdf || dlNameFrom(url, b.type), mime: b.type || '', blob: b });",
+"        });",
+"      }, function (eN) {",
+"        up({ type: 'dlerr', name: nm || dlNameFrom(url, ''), why: 'the relay did not answer' });",
+"      }).catch(function (eC) {",
+"        up({ type: 'dlerr', name: nm || dlNameFrom(url, ''), why: String((eC && eC.message) || eC).slice(0, 80) });",
+"      });",
+"    } catch (eS) {",
+"      up({ type: 'dlerr', name: nm || 'download', why: 'blocked before it started' });",
+"    }",
+"  }",
+"  if (SD) {",
+"    /* v7.3: capture-phase download tap - registered BEFORE the nav",
+"     * capture below so an <a download> never becomes a sandbox",
+"     * navigation; preventDefault also makes the nav capture bail. */",
+"    document.addEventListener('click', function (e) {",
+"      try {",
+"        if (e.button !== undefined && e.button !== 0) return;",
+"        var t = e.target;",
+"        var a = t && t.closest ? t.closest('a[download]') : null;",
+"        if (!a) return;",
+"        var href = a.getAttribute('href') || '';",
+"        if (!href || href.charAt(0) === '#' || /^javascript:/i.test(href)) return;",
+"        e.preventDefault();",
+"        e.stopPropagation();",
+"        try { e.stopImmediatePropagation(); } catch (eSI) { /* ignore */ }",
+"        bridgeDownload(href, a.getAttribute('download') || '');",
+"      } catch (eDL) { /* the bridge must never break a click */ }",
+"    }, true);",
+"  }",
 "",
 "  /* ---------- click / submit capture (fallback layer) ---------- */",
 "  document.addEventListener('click', function (e) {",
@@ -1268,7 +1337,7 @@ const PATCH_JS = [
 "    } catch (eE) { /* ignore */ }",
 "    /* the submit button that fired (name+value) is not in elements' values */",
 "    try {",
-"      if (f.__ohpSubBtn && f.__ohpSubBtn.name) parts.push([f.__ohpSubBtn.name, f.__ohpSubBtn.value || '']);",
+"      if (f.__zpSubBtn && f.__zpSubBtn.name) parts.push([f.__zpSubBtn.name, f.__zpSubBtn.value || '']);",
 "    } catch (eS) { /* ignore */ }",
 "    var qs = parts.map(function (p) { return encodeURIComponent(p[0]) + '=' + encodeURIComponent(p[1] || ''); }).join('&');",
 "    var ct = enctype.indexOf('text/plain') >= 0 ? 'text/plain' : 'application/x-www-form-urlencoded';",
@@ -1281,7 +1350,7 @@ const PATCH_JS = [
 "      document.addEventListener('click', function (e) {",
 "        try {",
 "          var b = e.target && e.target.closest ? e.target.closest('button, input[type=submit], input[type=image]') : null;",
-"          if (b && b.form) b.form.__ohpSubBtn = b;",
+"          if (b && b.form) b.form.__zpSubBtn = b;",
 "        } catch (eB) { /* ignore */ }",
 "      }, true);",
 "      document.addEventListener('submit', function (e) {",
@@ -1295,7 +1364,7 @@ const PATCH_JS = [
 "          /* v6: SPA-managed forms (NO action attribute \u2014 the app's own",
 "           * onsubmit handler owns the submit: captcha flows, fetch-based",
 "           * logins, search boxes) must be LEFT ALONE. v5 serialized EVERY",
-"   * form into a GET/POST navigation — which hijacked the app",
+"           * form into a GET/POST navigation \u2014 which hijacked the z.ai",
 "           * login form (email+password folded into the URL as a QUERY",
 "           * STRING!), swapped the document, and killed the app's own",
 "           * captcha\u2192signin chain: the \"sign-in buttons do nothing\"",
@@ -1330,56 +1399,6 @@ const PATCH_JS = [
 "          }",
 "        } catch (errS) { /* ignore */ }",
 "      }, true);",
-"",
-"      /* ---------- v6.9: programmatic form.submit() --------------------",
-"       * IdP pages auto-submit their verification forms programmatically:",
-"       * GitHub's 2FA page calls form.submit() the instant the 6th code",
-"       * digit lands. A programmatic submit fires NO 'submit' event, so",
-"       * the arm above never sees it \u2014 the native submission would steer",
-"       * the sandbox frame to the action URL (or the Navigation API",
-"       * handler would nav() the destination WITHOUT the form body), and",
-"       * the upstream answers 422 (Rails: missing authenticity_token).",
-"       * Route programmatic submits through the exact same serialize +",
-"       * nav() path as clicked submits. */",
-"      try {",
-"        var _formSubmit = HTMLFormElement.prototype.submit;",
-"        HTMLFormElement.prototype.submit = function () {",
-"          try {",
-"            if (!SD) return _formSubmit.apply(this, arguments);",
-"            var f = this;",
-"            if (!f || !f.getAttribute) return _formSubmit.apply(f, arguments);",
-"            var action = f.getAttribute('action') || '';",
-"            if (!action || action === '#' || action.charAt(0) === '#' || /^javascript:/i.test(action)) {",
-"              return _formSubmit.apply(f, arguments); /* SPA-managed: native */",
-"            }",
-"            var dest = action;",
-"            if (isWorkerUrl(dest)) {",
-"              var serW = serializeForm(f);",
-"              if ((serW.method || 'GET') === 'GET') {",
-"                var baseW = dest.split('#')[0].split('?')[0];",
-"                nav(baseW + (serW.body ? '?' + serW.body : ''));",
-"              } else {",
-"                nav(dest, serW.method, serW.body, serW.ct);",
-"              }",
-"              return undefined;",
-"            }",
-"            if (/^https?:\\/\\//i.test(dest) && !allowedHost((dest.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1])) {",
-"              up({ type: 'ext', url: dest });",
-"              return undefined;",
-"            }",
-"            var ser = serializeForm(f);",
-"            if ((ser.method || 'GET') === 'GET') {",
-"              var base = dest.split('#')[0].split('?')[0];",
-"              nav(base + (ser.body ? '?' + ser.body : ''));",
-"            } else {",
-"              nav(dest, ser.method, ser.body, ser.ct);",
-"            }",
-"            return undefined;",
-"          } catch (eFS) {",
-"            try { return _formSubmit.apply(this, arguments); } catch (eFS2) { /* ignore */ }",
-"          }",
-"        };",
-"      } catch (eProto) { /* ignore */ }",
 "    }",
 "  } catch (eSubArm) { /* ignore */ }",
 "",
@@ -1431,7 +1450,7 @@ const PATCH_JS = [
 "",
 "  /* ---------- dynamic subresource rewriting ----------",
 "   * The SPA builds absolute URLs at runtime for images, scripts,",
-"   * stylesheets and downloads (e.g. cross-host asset CDNs).",
+"   * stylesheets and downloads (e.g. https://z-cdn.chatglm.cn/\u2026).",
 "   * Those would leave the proxy and die on a network that can only",
 "   * reach the worker. Rewrite them as they are inserted \u2014 hosts that",
 "   * are not allowlisted are left untouched (they fail quietly, like",
@@ -1719,7 +1738,7 @@ const PATCH_JS = [
 "    function makeShim(name) {",
 "      var mem = (name === 'localStorage') ? lsMirror : {};",
 "      /* v6.5: real Storage objects accept BOTH method calls and plain",
-"       * property access. Some bundles NEVER call setItem('token'): all",
+"       * property access. z.ai's bundle NEVER calls setItem('token'): all",
 "       * five token writes are `localStorage.token = jwt`, read back with",
 "       * getItem at send time — the old plain-object shim dropped every",
 "       * property write, so sends shipped `authorization: Bearer null`",
@@ -1821,6 +1840,7 @@ const PATCH_JS = [
 "      }",
 "      switch (d.cmd) {",
 "        case 'init':",
+"          if (typeof d.ok === 'string' && d.ok) OKEY = d.ok; /* v7.1: the shell refreshes the owner key */",
 "          if (Array.isArray(d.jar)) {",
 "            var jarM = {};",
 "            jar.forEach(function (c) { if (c && c.name) jarM[c.name] = c; });",
@@ -1838,6 +1858,12 @@ const PATCH_JS = [
 "        case 'back': history.back(); break;",
 "        case 'forward': history.forward(); break;",
 "        case 'reload': location.reload(); break;",
+"        case 'key':",
+"          /* v7.2: the shell hands the runtime its slot key mid-session",
+"           * (a claim that just landed) so capture and the recovery",
+"           * assists work from this request on. */",
+"          if (typeof d.ok === 'string' && d.ok) OKEY = d.ok;",
+"          break;",
 "        case 'navigate':",
 "          if (d.url) location.href = mapUrl(String(d.url));",
 "          break;",
@@ -1857,6 +1883,8 @@ const PATCH_JS = [
 "              doc: DOC || '',",
 "              locHref: (window.__ohLoc && window.__ohLoc.href) || '',",
 "              realHref: (function () { try { return location.href; } catch (eR) { return '(throws)'; } })(),",
+"              initAliyun: typeof window.initAliyunCaptcha,",
+"              aliCfg: typeof window.AliyunCaptchaConfig === 'object' ? 'set' : 'unset',",
 "              scripts: pScripts,",
 "              forms: (function () { var n = 0; try { n = document.querySelectorAll('form').length; } catch (eF) { } return n; })(),",
 "              title: document.title || ''",
@@ -1904,37 +1932,35 @@ const PATCH_JS = [
 /* ============================================================ */
 
 /* ============================================================
- * v6.7: /__vault — the session vault
+ * v6.9: /__session — the relay-held session (single user)
  * ------------------------------------------------------------
- * Some phone "viewer" apps open saved HTML files in ephemeral
- * contexts: the moment the file closes, localStorage — and with it
- * the saved OpenHands session (cookie jar + login token) — is GONE, and
- * the user signs in again on every single open. The vault is the
- * way out: the pocket file encrypts its session snapshot
- * client-side (AES-GCM, key derived from a secret only the user
- * knows via PBKDF2) and stores the ciphertext HERE, in the edge
- * cache, under a cache key derived from SHA-256(secret + deploy
- * key). The worker never sees plaintext and never sees the secret
- * itself (only its hash). On a wiped phone the user types the
- * secret once and the session comes back.
+ * The user asked for the simplest possible persistence: "have the
+ * worker keep the session open — I am only using the worker for
+ * myself." No secrets, no device keys, no vaults (both are gone).
+ * It works because the relay already sees every byte of the
+ * session: z.ai hands it out as set-cookie headers on responses,
+ * the app sends it as the Bearer token on API requests, and every
+ * /api/v1/auths answer names the authoritative {token, id, role}.
+ * The worker captures all three PASSIVELY (zero client help) into
+ * one edge-cache slot:
  *
- *   GET    /__vault  (x-vault-pin) -> the stored blob, or 404
- *   POST   /__vault  (x-vault-pin) -> store/replace the blob
- *   DELETE /__vault  (x-vault-pin) -> forget the blob
+ *   GET    /__session -> {ok, has, savedAt, token, jar:[{name,value}]}
+ *   DELETE /__session -> forget it (a clean sign-out)
  *
- * Wrong-secret probing is rate-limited per IP and yields nothing:
- * a wrong secret hashes to a different cache key (a miss), and a
- * right secret is required to decrypt the payload anyway.
- * Cache entries live 30 days; every re-save refreshes that clock.
+ * The pocket fetches it once per open, before the first document
+ * load, so the app boots already signed in — on ANY phone, no
+ * matter what its viewer does to localStorage. A GUEST capture
+ * never demotes a held USER session (auths names the role, and a
+ * foreign Bearer's JWT id is compared before it is taken); a
+ * sign-out clears the jar (logout set-cookies are dead-cookie
+ * removals), so a signed-out file boots signed out. Every
+ * operation reads/writes the edge cache directly (no isolate
+ * memory), so every Cloudflare isolate stays coherent. Captures
+ * run via event.waitUntil and can never break the proxy.
  * ============================================================ */
 
-const VAULT_MAX_BYTES = 65536;
-const vaultFails = new Map(); /* ip -> {n, t} — wrong-pin attempts in the window */
-
-function vaultPinOk(pin) {
-  return typeof pin === 'string' && pin.length >= 6 && pin.length <= 128 &&
-    /^[\x20-\x7e]+$/.test(pin); /* printable, no header-hostile bytes */
-}
+const sessionHits = new Map(); /* ip -> {n, t} — /__session ops in the window */
+const SESSION_EMPTY = { jar: {}, token: '', role: '', id: '', em: '', nm: '', key: '', stale: 0, ts: 0, cloud: null };
 
 async function sha256Hex(str) {
   const dig = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
@@ -1944,71 +1970,399 @@ async function sha256Hex(str) {
   return out;
 }
 
-function vaultRateGate(req) {
-  /* per-IP wrong-pin throttle: the map is per isolate (best effort,
-   * colo-local) — enough to make blind probing of a 6+ char secret
-   * hopeless while never bothering an honest user. */
-  const ip = String(req.headers.get('cf-connecting-ip') || req.headers.get('x-real-ip') || 'unknown').slice(0, 64);
-  const now = Date.now();
-  if (vaultFails.size > 4096) {
-    for (const [k, v] of vaultFails) { if (now - v.t > 120000) vaultFails.delete(k); }
-  }
-  const e = vaultFails.get(ip);
-  return { ip: ip, e: e, now: now };
+/* the JWT payload (id/role) — used when a captured Bearer IS a JWT;
+ * OpenHands API keys are opaque strings, in which case this is null. */
+function jwtClaims(t) {
+  try {
+    const parts = String(t || '').split('.');
+    if (parts.length !== 3) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (parts[1].length % 4)) % 4);
+    const dec = JSON.parse(atob(b64));
+    return (dec && typeof dec === 'object') ? dec : null;
+  } catch (e) { return null; }
 }
 
-async function handleVault(req, url) {
-  const method = req.method.toUpperCase();
-  const pin = req.headers.get('x-vault-pin') || '';
-  if (!vaultPinOk(pin)) {
-    return json({ ok: false, error: 'missing or bad secret (x-vault-pin, 6+ printable characters)' }, req, 400);
+function sessionRateOk(req) {
+  /* light cap: 120 ops / 2 min / IP */
+  const ip = String(req.headers.get('cf-connecting-ip') || req.headers.get('x-real-ip') || 'unknown').slice(0, 64);
+  const now = Date.now();
+  if (sessionHits.size > 4096) {
+    for (const [k, v] of sessionHits) { if (now - v.t > 120000) sessionHits.delete(k); }
   }
-  const origin = new URL(req.url).origin;
-  const keyUrl = origin + '/__vault/' + (await sha256Hex(TOK_KEY + '|ohp-vault-v1|' + pin));
-  const cache = caches.default;
+  const e = sessionHits.get(ip);
+  if (e && now - e.t < 120000) { e.n++; return e.n <= 120; }
+  sessionHits.set(ip, { n: 1, t: now });
+  return true;
+}
 
-  if (method === 'GET' || method === 'HEAD') {
-    const g = vaultRateGate(req);
-    if (g.e && g.e.n >= 6 && g.now - g.e.t < 120000) {
-      return json({ ok: false, error: 'too many attempts — wait two minutes and try again' }, req, 429);
-    }
-    let hit = null;
-    try { hit = await cache.match(keyUrl); } catch (eC) { hit = null; }
-    if (!hit) {
-      if (g.e) { g.e.n++; g.e.t = g.now; } else { vaultFails.set(g.ip, { n: 1, t: g.now }); }
-      return json({ ok: false, error: 'no backup found for this secret' }, req, 404);
-    }
-    if (g.e) vaultFails.delete(g.ip); /* a good pin clears the slate */
-    const body = await hit.text();
-    const h = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-    return new Response(body, { status: 200, headers: corsHeaders(req, h) });
-  }
+/* v1.0: the slot key is ORIGIN-INDEPENDENT (a fixed synthetic URL).
+ * The zp original keyed the cache on the request origin — fine for
+ * fetch traffic, but the CRON keep-alive (the scheduled handler)
+ * has no request, and a worker reachable under several hostnames
+ * would have grown several slots. One fixed key = one slot, shared
+ * by the fetch handler and the cron. Pinned to the BASE token key
+ * so setting/changing OWNER_KEY never orphans a saved session. */
+async function sessionKeyUrl() {
+  return 'https://ohp-slot.internal/__session/' + (await sha256Hex(TOK_KEY_BASE + '|ohp-session-v1'));
+}
 
-  if (method === 'POST' || method === 'PUT') {
-    const body = await req.text();
-    if (!body || body.length > VAULT_MAX_BYTES) {
-      return json({ ok: false, error: 'blob must be 1..' + VAULT_MAX_BYTES + ' bytes' }, req, 400);
+/* ---- the OWNER KEY gate (zp 7.1/7.3, unchanged) ------------------
+ * The OWNER_KEY (any long secret) makes the session features
+ * PRIVATE to one owner. Every session operation — GET/DELETE
+ * /__session, passive capture, the 401-recovery assist, the
+ * signout-forget — requires x-ohp-owner with the same key
+ * (SHA-256 compared on both sides; stripped before anything goes
+ * upstream). A worker with NO owner key runs in AUTO mode: the
+ * relay locks itself to the first account that signs in. */
+function ownerKeyOf(event) {
+  const env = envOf(event) || {};
+  return String(OWNER_KEY || env.OWNER_KEY || env.OHP_OWNER_KEY || '').trim();
+}
+async function ownerKeyOk(req, event) {
+  const want = ownerKeyOf(event);
+  if (!want) return false;
+  const got = String(req.headers.get('x-ohp-owner') || '').trim();
+  if (!got) return false;
+  try {
+    const a = await sha256Hex('ohp-owner-v1|' + want);
+    const b = await sha256Hex('ohp-owner-v1|' + got);
+    return a === b;
+  } catch (eK) { return false; }
+}
+
+/* ---- AUTO mode — the relay locks to the first account that signs
+ * in (zp 7.2, unchanged mechanics). The first USER identity answer
+ * through a fresh relay CLAIMS the slot: mint a random 128-bit
+ * key, store it WITH the session, hand it to that one device on
+ * x-ohp-claim. A phone that loses it just signs in again — same
+ * account, keyless — and the key re-issues. Anyone else holding
+ * the worker URL proxies as a plain guest. */
+function newSlotKey() {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  let s = 'ohp-auto-';
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, '0');
+  return s;
+}
+async function slotKeyOk(req, st) {
+  const want = String((st && st.key) || '').trim();
+  if (!want) return false;
+  const got = String(req.headers.get('x-ohp-owner') || '').trim();
+  if (!got) return false;
+  try {
+    const a = await sha256Hex('ohp-owner-v1|' + want);
+    const b = await sha256Hex('ohp-owner-v1|' + got);
+    return a === b;
+  } catch (eSK) { return false; }
+}
+
+async function sessionRead() {
+  try {
+    const hit = await caches.default.match(await sessionKeyUrl());
+    if (hit) {
+      const j = JSON.parse(await hit.text());
+      if (j && typeof j === 'object') {
+        return {
+          jar: (j.jar && typeof j.jar === 'object' && !Array.isArray(j.jar)) ? j.jar : {},
+          token: typeof j.token === 'string' ? j.token : '',
+          role: typeof j.role === 'string' ? j.role : '',
+          id: typeof j.id === 'string' ? j.id : '',
+          em: typeof j.em === 'string' ? j.em : '',
+          nm: typeof j.nm === 'string' ? j.nm : '',
+          key: typeof j.key === 'string' ? j.key : '', /* the auto-issued slot key */
+          stale: j.stale || 0, /* the held sign-in died upstream — honest status */
+          ts: j.ts || 0,
+          cloud: (j.cloud && typeof j.cloud === 'object') ? j.cloud : null, /* keep-alive snapshot */
+        };
+      }
     }
-    try { JSON.parse(body); } catch (eJ) {
-      return json({ ok: false, error: 'blob must be JSON' }, req, 400);
-    }
+  } catch (eR) { /* cache hiccup: act empty */ }
+  return { jar: {}, token: '', role: '', id: '', em: '', nm: '', key: '', stale: 0, ts: 0, cloud: null };
+}
+
+async function sessionWrite(st) {
+  try {
+    const body = JSON.stringify({ jar: st.jar, token: st.token, role: st.role, id: st.id, em: st.em || '', nm: st.nm || '', key: st.key || '', stale: st.stale || 0, ts: st.ts, cloud: st.cloud || null });
     const toStore = new Response(body, {
       headers: { 'content-type': 'application/json', 'cache-control': 'max-age=2592000' }, /* 30 days */
     });
+    await caches.default.put(new Request(await sessionKeyUrl(), { method: 'GET' }), toStore);
+  } catch (eP) { /* cache refused — nothing we can do; the next capture retries */ }
+}
+
+/* set-cookie array -> jar merge: an empty value or a past expiry REMOVES */
+function sessionEatSetCookies(st, list) {
+  let changed = false;
+  (list || []).forEach((raw) => {
     try {
-      await cache.put(new Request(keyUrl, { method: 'GET' }), toStore);
-    } catch (eP) {
-      return json({ ok: false, error: 'vault storage refused the blob' }, req, 503);
+      const bits = String(raw).split(';');
+      const nv = bits[0];
+      const eq = nv.indexOf('=');
+      if (eq < 1) return;
+      const name = nv.slice(0, eq).trim();
+      if (!name) return;
+      const value = nv.slice(eq + 1).trim();
+      let dead = value === '';
+      for (let i = 1; i < bits.length; i++) {
+        const b = bits[i].trim().toLowerCase();
+        if (b === 'max-age=0' || b === 'max-age=-1' || b === 'expires=thu, 01 jan 1970 00:00:00 gmt') dead = true;
+        const mEx = b.match(/^expires=(.+)$/);
+        if (mEx) { const t = Date.parse(mEx[1]); if (!isNaN(t) && t <= Date.now()) dead = true; }
+      }
+      if (dead) { if (name in st.jar) { delete st.jar[name]; changed = true; } }
+      else if (st.jar[name] !== value) { st.jar[name] = value; changed = true; }
+    } catch (eC) { /* ignore a malformed cookie */ }
+  });
+  return changed;
+}
+
+/* passive capture — the proxy path calls this (waitUntil).
+ * OpenHands session truth, unlike the z.ai JWT flow, rides on
+ * COOKIES; authsObj = a parsed identity answer
+ * ({id, role, em, nm} from /api/organizations/{orgId}/me) when
+ * this response IS one; bearer = the request's Bearer (an API
+ * key), when present. opts.claimKey: the proxy path decided THIS
+ * answer claims (or re-issues) the slot; landing it here binds
+ * the minted key to the session in the same write. */
+async function sessionCapture(req, bearer, setCookieList, authsObj, opts) {
+  try {
+    const st = await sessionRead();
+    const heldUser = !!(st.role && st.role !== 'guest' && st.id);
+    let changed = sessionEatSetCookies(st, setCookieList);
+    if (opts && opts.claimKey && !st.key) {
+      st.key = String(opts.claimKey);
+      changed = true;
     }
-    return json({ ok: true, bytes: body.length, ts: Date.now() }, req);
-  }
+    /* (1) the identity answer is authoritative: a USER identity
+     * (user_id present) always wins; it never demotes a held one
+     * (a foreign identity simply never gets capture rights — see
+     * the claim decision in the proxy path). */
+    if (authsObj && authsObj.id) {
+      if (st.id !== String(authsObj.id)) { st.id = String(authsObj.id); changed = true; }
+      const role = String(authsObj.role || 'user');
+      if (role && st.role !== role) { st.role = role; changed = true; }
+      /* a real identity answer is a live sign-in — any stale mark dies */
+      if (st.stale) { st.stale = 0; changed = true; }
+      const em = String(authsObj.em || '');
+      const nm = String(authsObj.nm || '');
+      if (em && st.em !== em) { st.em = em; changed = true; }
+      if (nm && st.nm !== nm) { st.nm = nm; changed = true; }
+    }
+    /* (2) a Bearer (API key) lands when the slot holds no user
+     * identity, or when the owner's own traffic carries one and
+     * the slot has no key yet. It must never overwrite a held
+     * identity's key with a stranger's. */
+    const authsWon = !!(authsObj && authsObj.id);
+    if (bearer && !authsWon && (!heldUser || !st.token)) {
+      if (st.token !== bearer) { st.token = bearer; changed = true; }
+    }
+    if (changed) {
+      st.ts = Date.now();
+      /* a stale mark set by a concurrent capture may land between
+       * this capture's read and write — only a real identity answer
+       * clears it (above); any other write must preserve it. */
+      if (!authsWon) {
+        try {
+          const curSt = await sessionRead();
+          if (curSt && curSt.stale && !st.stale) st.stale = curSt.stale;
+        } catch (ePRS) { /* ignore */ }
+      }
+      await sessionWrite(st);
+    }
+  } catch (eS) { /* capture must never break the proxy */ }
+}
 
+/* the endpoint: GET / DELETE (POST is intentionally absent — the
+ * capture path is the only writer; the pocket never uploads) */
+async function handleSession(req, url, event) {
+  const method = req.method.toUpperCase();
+  if (!sessionRateOk(req)) {
+    return json({ ok: false, error: 'too many requests — wait two minutes and try again' }, req, 429);
+  }
+  /* keyed mode (OWNER_KEY set): the master key must match.
+   * AUTO mode: a slot is LOCKED once it holds a key, a token or
+   * any jar — then the slot's own key must match. An empty
+   * unclaimed slot answers GET keylessly with has:false. */
+  if (ownerKeyOf(event)) {
+    if (!(await ownerKeyOk(req, event))) {
+      return json({ ok: false, mode: 'keyed', error: 'wrong or missing owner key (x-ohp-owner)' }, req, 403);
+    }
+  } else {
+    const st = await sessionRead();
+    const locked = !!(st.key || st.token || (st.jar && Object.keys(st.jar).length));
+    if (locked && !(await slotKeyOk(req, st))) {
+      if (method === 'GET' || method === 'HEAD') {
+        return json({ ok: false, mode: 'auto', locked: true, error: "this relay keeps someone's sign-in — it answers only to its key" }, req, 403);
+      }
+      return json({ ok: false, mode: 'auto', error: 'locked — this relay answers only to its key' }, req, 403);
+    }
+    if ((method === 'GET' || method === 'HEAD') && !locked) {
+      const jar = Object.keys(st.jar).map((name) => ({ name: name, value: st.jar[name] }));
+      return json({ ok: true, mode: 'auto', unclaimed: true, has: false, savedAt: 0, token: '', role: '', id: '', email: '', name: '', jar: jar, cloud: null }, req);
+    }
+  }
+  if (method === 'GET' || method === 'HEAD') {
+    const st = await sessionRead();
+    /* KEEP-THE-SESSION-OPEN: the pocket pulls this on every open.
+     * If the held session has been idle past the threshold (5 min),
+     * refresh it in the background — the cron tick does the same
+     * every 5 minutes while the file is closed, so the sign-in
+     * never goes stale and the cloud snapshot stays fresh. */
+    const kaMs = parseInt(String((envOf(event) || {}).SESSION_KEEPALIVE_MS || ''), 10) || 5 * 60 * 1000;
+    const hasSess = !!((st.jar && Object.keys(st.jar).length) || st.token);
+    if (hasSess && (Date.now() - (st.ts || 0) > kaMs)) {
+      const pKA = cloudTick(event);
+      if (event && typeof event.waitUntil === 'function') { try { event.waitUntil(pKA); } catch (eWK) { pKA.catch(function () { }); } }
+      else pKA.catch(function () { });
+    }
+    const jar = Object.keys(st.jar).map((name) => ({ name: name, value: st.jar[name] }));
+    const has = !!(st.token || jar.length);
+    return json({
+      ok: true, has: has, savedAt: st.ts || 0, token: st.token || '',
+      role: st.role || '', id: st.id || '', email: st.em || '', name: st.nm || '',
+      stale: !!st.stale, jar: jar, cloud: st.cloud || null,
+    }, req);
+  }
   if (method === 'DELETE') {
-    try { await cache.delete(keyUrl); } catch (eD) { /* idempotent */ }
-    return json({ ok: true, note: 'vault cleared for this secret' }, req);
+    /* a real sign-out — kill the session UPSTREAM too, so the
+     * forgotten session is actually dead (not just forgotten). */
+    const st = await sessionRead();
+    if ((st.jar && Object.keys(st.jar).length) || st.token) {
+      const pOut = sessionUpstreamSignout(event, st);
+      if (event && typeof event.waitUntil === 'function') { try { event.waitUntil(pOut); } catch (eWO) { pOut.catch(function () { }); } }
+      else pOut.catch(function () { });
+    }
+    try { await caches.default.delete(await sessionKeyUrl()); } catch (eD) { /* idempotent */ }
+    return json({ ok: true, note: 'session forgotten' }, req);
   }
+  return json({ ok: false, error: 'use GET or DELETE' }, req, 405);
+}
 
-  return json({ ok: false, error: 'use GET, POST or DELETE' }, req, 405);
+/* ---- THE KEEP-ALIVE + CLOUD STATUS POLL -----------------------------
+ * "Keep the session open so the cloud AI can still run while I
+ * leave the html file, and when I come back my projects are
+ * done." OpenHands Cloud conversations execute server-side —
+ * closing the pocket never stops an agent. The sign-in is the
+ * only thing that can die while you are away, so the cron
+ * trigger (wrangler.toml [triggers] crons = ["*\/5 * * * *"])
+ * fires cloudTick() every 5 minutes. It skips work while the
+ * relay sees fresh traffic (active use keeps the session warm by
+ * itself), and otherwise:
+ *   1. GETs the conversation list with the held session — the
+ *      answer's set-cookies slide the session forward (auth
+ *      refresh) exactly like the app's own traffic would;
+ *   2. stores a compact snapshot (running / finished / errored
+ *      counts + the latest titles) in the slot, which the
+ *      pocket's "Cloud agents" card renders the moment the file
+ *      opens again;
+ *   3. marks the slot stale when the sign-in truly died upstream
+ *      (the honest status — the pocket says "sign in again"
+ *      instead of booting into a dead session).
+ * The same tick runs on-demand when the pocket opens the file
+ * after an idle gap (see handleSession). */
+const CLOUD_POLL_MIN_MS = 15 * 60 * 1000; /* fresher than this = skip */
+const CLOUD_ITEMS = 12;                   /* snapshot items kept */
+
+function cloudClassify(s) {
+  const v = String(s || 'idle').toLowerCase();
+  if (v === 'running' || v === 'waiting_for_confirmation' || v === 'stuck') return 'running';
+  if (v === 'finished') return 'finished';
+  if (v === 'error') return 'error';
+  if (v === 'paused') return 'paused';
+  return 'idle';
+}
+
+async function cloudTick(event) {
+  try {
+    const st = await sessionRead();
+    const hasJar = !!(st.jar && Object.keys(st.jar).length);
+    if (!hasJar && !st.token) return;
+    if (st.ts && (Date.now() - st.ts) < CLOUD_POLL_MIN_MS) return;
+    const up = appUpstream(event);
+    const jarStr = Object.keys(st.jar || {}).map((n) => n + '=' + st.jar[n]).join('; ');
+    const hdrs = {
+      'accept': 'application/json',
+      'accept-encoding': 'gzip, deflate, br',
+      'user-agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+      'referer': up + '/',
+    };
+    if (jarStr) hdrs['cookie'] = jarStr;
+    if (st.token) hdrs['authorization'] = 'Bearer ' + st.token;
+    const listUrl = up + '/api/v1/app-conversations?limit=20&sort_order=UPDATED_AT_DESC';
+    let r = await fetch(listUrl, { method: 'GET', headers: hdrs, redirect: 'manual' });
+    /* one recovery retry without the Bearer — a stale API key must
+     * never mask a perfectly good cookie session */
+    if ((r.status === 401 || r.status === 403) && st.token) {
+      try { if (r.body && r.body.cancel) r.body.cancel(); } catch (eC) { /* ignore */ }
+      const h2 = Object.assign({}, hdrs);
+      delete h2['authorization'];
+      r = await fetch(listUrl, { method: 'GET', headers: h2, redirect: 'manual' });
+    }
+    if (r.status === 200) {
+      const sc = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
+      let j = null;
+      try { j = JSON.parse(await r.text()); } catch (eJ) { j = null; }
+      const st2 = await sessionRead();
+      if (sc.length) sessionEatSetCookies(st2, sc);
+      if (j && Array.isArray(j.items)) {
+        const items = [];
+        let running = 0, finished = 0, errored = 0;
+        j.items.slice(0, 20).forEach((it) => {
+          if (!it) return;
+          const cls = cloudClassify(it.execution_status || it.sandbox_status || 'idle');
+          if (cls === 'running') running++;
+          else if (cls === 'finished') finished++;
+          else if (cls === 'error') errored++;
+          if (items.length < CLOUD_ITEMS) {
+            items.push({
+              i: String(it.id || ''),
+              t: String(it.title || 'Untitled').slice(0, 80),
+              s: cls,
+              u: String(it.updated_at || ''),
+            });
+          }
+        });
+        st2.cloud = { ts: Date.now(), total: j.items.length, running: running, finished: finished, error: errored, items: items };
+      }
+      if (st2.stale) { st2.stale = 0; }
+      st2.ts = Date.now();
+      await sessionWrite(st2);
+    } else if (r.status === 401 || r.status === 403) {
+      /* the held sign-in died upstream — say so honestly */
+      const st2 = await sessionRead();
+      if (!st2.stale) { st2.stale = Date.now(); await sessionWrite(st2); }
+      try { if (r.body && r.body.cancel) r.body.cancel(); } catch (eC2) { /* ignore */ }
+    } else {
+      try { if (r.body && r.body.cancel) r.body.cancel(); } catch (eC3) { /* ignore */ }
+    }
+  } catch (eT) { /* the tick is best effort — the next cron tries again */ }
+}
+
+/* the cron entry point — wrangler.toml wires the trigger */
+addEventListener('scheduled', (event) => {
+  event.waitUntil(cloudTick(event));
+});
+
+/* fire the app's own logout call upstream with the held session,
+ * so a forgotten session is a DEAD session. OpenHands signs out
+ * via its auth logout route; best effort — the slot is deleted
+ * either way. */
+async function sessionUpstreamSignout(event, st) {
+  try {
+    const h = new Headers({
+      'accept': 'application/json',
+      'accept-encoding': 'gzip, deflate, br',
+      'user-agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+      'origin': appUpstream(event),
+      'referer': appUpstream(event) + '/',
+    });
+    const jarStr = Object.keys(st.jar || {}).map((n) => n + '=' + st.jar[n]).join('; ');
+    if (jarStr) h.set('cookie', jarStr);
+    if (st.token) h.set('authorization', 'Bearer ' + st.token);
+    const up = new URL('/api/auth/logout', appUpstream(event));
+    const r = await fetch(up.toString(), { method: 'POST', headers: h, redirect: 'manual' });
+    try { if (r.body && r.body.cancel) r.body.cancel(); } catch (eC) { /* ignore */ }
+  } catch (eSO) { /* best effort — the slot is deleted either way */ }
 }
 
 addEventListener('fetch', (event) => {
@@ -2025,6 +2379,41 @@ async function handle(req, event) {
       return new Response(null, { status: 204, headers: corsHeaders(req, new Headers()) });
     }
 
+    /* ---- v7.4: THE FULL LOCK (keyed mode) ------------------------------
+     * OWNER_KEY set: the relay is the owner's alone — no app, no
+     * proxying, no diagnostics without the key. Two exceptions:
+     * /__status answers keylessly as a locked stub (the pocket's
+     * health probe still works; the app entry token exists only for
+     * the key holder), and /__t + /__o stay open to VALID tokens
+     * only — the app's subresources are browser-level fetches that
+     * cannot carry headers. The whole token space is re-keyed with
+     * a mask derived from the OWNER_KEY (see TOK_KEY above), so no
+     * pre-key or foreign token decodes: the lock has no side door. */
+    if (ownerKeyOf(event) && !(await ownerKeyOk(req, event))) {
+      const lockP = url.pathname;
+      if (lockP === '/__status') {
+        return json({ ok: true, name: VERSION, time: new Date().toISOString(), session: true, session_mode: 'keyed', locked: true }, req);
+      }
+      let tokOk = false;
+      if (lockP.startsWith('/__t/')) {
+        try {
+          const decL = decTok(lockP.slice(5));
+          tokOk = !!(decL && /^https?:\/\//i.test(decL) && hostAllowed(new URL(decL).host, event));
+        } catch (eLT) { tokOk = false; }
+      } else if (lockP.startsWith('/__o/')) {
+        try {
+          const restL = lockP.slice(5);
+          const slashL = restL.indexOf('/');
+          const otokL = slashL < 0 ? restL : restL.slice(0, slashL);
+          const decL = decTok(otokL);
+          tokOk = !!(decL && /^https?:\/\/[a-z0-9.:-]+\/?$/i.test(decL) && hostAllowed(new URL(decL.replace(/\/+$/, '') + '/').host, event));
+        } catch (eLO) { tokOk = false; }
+      }
+      if (!tokOk) {
+        return json({ ok: false, mode: 'keyed', error: 'locked — this relay answers only to its owner key' }, req, 403);
+      }
+    }
+
     /* ---- public endpoints ---- */
     if (url.pathname === '/__status') {
       const env = envOf(event);
@@ -2036,10 +2425,16 @@ async function handle(req, event) {
       }
       /* v5: "entry" is the tokenized ROOT DOCUMENT path — the saved
        * pocket file fetches it to boot the app without ever knowing
-       * the token key or the upstream host. Neutral JSON: no app
+       * the token key or the upstream host. Neutral JSON: no z.ai
        * strings anywhere in this body. */
       const entry = tokPath(appUpstream(event) + '/');
-      return json({ ok: true, name: VERSION, time: new Date().toISOString(), token_required: !!token, token_ok: tokenOk, entry: entry }, req);
+      /* v7.2: sessions are ALWAYS on. session_mode says which flavor:
+       * "keyed" = OWNER_KEY (the optional master key) is set — strict
+       * v7.1 behavior; "auto" = the relay locks itself to the first
+       * account that signs in (zero setup — the pocket handles the
+       * rest). Absent session fields entirely = a pre-7.1 open relay. */
+      const masterKey = ownerKeyOf(event);
+      return json({ ok: true, name: VERSION, time: new Date().toISOString(), token_required: !!token, token_ok: tokenOk, session: true, session_mode: masterKey ? 'keyed' : 'auto', cloud: true, entry: entry }, req);
     }
 
     /* ---- neutral favicon: never a proxied page ---- */
@@ -2056,9 +2451,9 @@ async function handle(req, event) {
       return diagPage(req, event);
     }
 
-    /* ---- v6.7: the session vault (own auth: the user's secret) ---- */
-    if (url.pathname === '/__vault') {
-      return handleVault(req, url);
+    /* ---- v6.9: the relay-held session (single user, no secrets) ---- */
+    if (url.pathname === '/__session') {
+      return handleSession(req, url, event);
     }
 
 
@@ -2087,7 +2482,7 @@ async function handle(req, event) {
 
     /* ---- v5: the root is a NEUTRAL service page ------------------
      * The phone never navigates here for content anymore — and it
-     * must never serve app HTML, so a content classifier that
+     * must never serve z.ai HTML, so a content classifier that
      * fetches the root sees a boring status page, not an AI chat
      * app. (The token gate above has already handled PROXY_TOKEN,
      * including the __t-query 302 cleanup, so this only runs for
@@ -2173,20 +2568,11 @@ async function handle(req, event) {
       pfx = '/p/' + host;
       upstream = 'https://' + host + path + url.search;
     } else {
-      /* v5: bare paths never mirror the upstream — the transparent
+      /* v5: bare paths no longer mirror chat.z.ai — the transparent
        * catch-all is GONE. Nothing navigates to this worker; the only
        * content route is /__t/<token>. Answer a neutral 404 so the
-       * origin never serves anything classifiable. v6.11: identifies
-       * as service "ohp" (the z-family leftover is gone) and carries
-       * the diagnostics so the pocket's card names the worker path. */
-      {
-        const rh404 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        rh404.set('x-ohp-up', req.url);
-        rh404.set('x-ohp-errbody', encodeURIComponent('The sandbox asked this relay for a path it does not serve: ' +
-          url.pathname.slice(0, 140) + ' — a navigation token was lost. Tap Retry.'));
-        return new Response(JSON.stringify({ ok: false, service: 'ohp', status: 404, note: 'nothing is served at this path' }),
-          { status: 404, headers: corsHeaders(req, rh404) });
-      }
+       * origin never serves anything classifiable. */
+      return json({ ok: false, service: 'zp', status: 404, note: 'nothing is served at this path' }, req, 404);
     }
 
     /* ---- query handling ----
@@ -2194,7 +2580,7 @@ async function handle(req, event) {
      * the query — strip it before going upstream. Token requests carry
      * their whole query INSIDE the token; any extra params the browser
      * appended (e.g. EventSource adding __t) are merged in, minus __t. */
-    let upUrl = new URL(upstream);
+    const upUrl = new URL(upstream);
     if (tokMode) {
       for (const [k, v] of url.searchParams) {
         if (k === '__t') continue;
@@ -2208,12 +2594,16 @@ async function handle(req, event) {
     const h = new Headers();
     const skipReq = new Set(['host', 'origin', 'referer', 'cookie', 'connection', 'keep-alive', 'upgrade',
       'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'content-length', 'accept-encoding',
-      'x-cookie', 'x-proxy-token', 'x-set-cookie']);
+      'x-cookie', 'x-proxy-token', 'x-set-cookie', 'x-ohp-owner', 'x-ohp-claim']);
+    /* v7.1: x-ohp-owner is this relay's OWN gate header (the owner
+     * key the pocket sends) — it must NEVER ride upstream.
+     * v7.2: x-ohp-claim (the minted-key RESPONSE header) is likewise
+     * stripped from REQUESTS — it only ever travels worker→client. */
     /* v3: Cloudflare's edge injects its own connection headers
      * (cf-connecting-ip, cf-ipcountry, cf-ray, cf-visitor,
      * x-forwarded-for, cdn-loop, true-client-ip, ...) into every
      * request that reaches this worker. Forwarding them to
-     * the upstream — which may run behind Cloudflare itself — sends
+     * chat.z.ai — which runs behind Cloudflare itself — sends
      * forged edge headers into another zone's WAF. They are
      * dropped here, always. */
     const dropExact = new Set(['cdn-loop', 'true-client-ip', 'x-real-ip']);
@@ -2228,6 +2618,19 @@ async function handle(req, event) {
       h.set(k, v);
     }
     h.set('accept-encoding', 'gzip, deflate, br');
+    /* v6.2: filebin (the copier's delivery host) serves a browser HTML
+     * wrapper to any browser-shaped User-Agent and the raw bytes to plain
+     * HTTP clients — and this worker forwards the caller's UA. For
+     * filebin requests only, claim a plain client UA so the payloads the
+     * copier pulls through /p/filebin.net/… arrive as raw bytes. */
+    const isFilebin = host && (host.toLowerCase() === 'filebin.net' || host.toLowerCase().endsWith('.filebin.net'));
+    if (isFilebin) {
+      /* filebin hands the raw file ONLY to curl-shaped clients (verified:
+       * curl/* -> 302 raw; wget, python-requests, any browser -> 200 HTML
+       * wrapper). Claim a curl identity for these delivery fetches. */
+      h.set('user-agent', 'curl/8.5.0');
+      h.set('accept', '*/*');
+    }
     /* v6.2: stream calls (the app's completions/continue SSE posts
      * carry Accept: text/event-stream) ask the upstream for IDENTITY
      * encoding — a compressed event-stream is a stream some upstream
@@ -2239,12 +2642,7 @@ async function handle(req, event) {
         h.set('accept-encoding', 'identity');
       }
     } catch (eAE) { /* keep */ }
-    /* v6.10: the runtime jar (x-cookie, refreshed by x-set-cookie on
-     * every response) is ALWAYS at least as fresh as whatever the
-     * browser's cookie store holds for this origin — and a STALE store
-     * value used to win this merge, poisoning fresh sign-ins with dead
-     * session cookies. Jar first; the browser store fills gaps only. */
-    h.set('cookie', mergeCookies(req.headers.get('x-cookie') || '', req.headers.get('cookie') || ''));
+    h.set('cookie', mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''));
     h.set('origin', 'https://' + host);
     h.set('referer', 'https://' + host + '/');
 
@@ -2261,149 +2659,266 @@ async function handle(req, event) {
       }
     }
 
+    /* v7.1 + v7.2: does THIS request carry a key the relay accepts?
+     * One evaluation, reused by every session feature below: passive
+     * capture, the sticky heal, the 401-recovery assist and the
+     * signout-forget. OWNER_KEY configured (keyed mode): the master
+     * key decides — and a slot key minted by an earlier auto claim
+     * still works on its own slot (the owner set the variable later).
+     * Auto mode: the SLOT's key decides. A request with no valid key
+     * (a stranger holding the worker URL + a pocket copy) proxies as
+     * a plain guest — it can never read, write, inject or forget the
+     * owner's session. */
+    let reqOwnerOk = false;
+    let reqMasterSet = false;
+    let reqSlotSt = null; /* v7.2: the slot, read once for auto rights */
+    if (host === appHost(event)) {
+      reqMasterSet = !!ownerKeyOf(event);
+      if (reqMasterSet) {
+        try { reqOwnerOk = await ownerKeyOk(req, event); } catch (eOK) { reqOwnerOk = false; }
+        if (!reqOwnerOk && String(req.headers.get('x-ohp-owner') || '').trim()) {
+          /* not the master key — but maybe this slot's own auto key */
+          try {
+            reqSlotSt = await sessionRead();
+            reqOwnerOk = await slotKeyOk(req, reqSlotSt);
+          } catch (eSK2) { reqOwnerOk = false; }
+        }
+      } else {
+        try { reqSlotSt = await sessionRead(); } catch (eSR) { reqSlotSt = null; }
+        try { reqOwnerOk = await slotKeyOk(req, reqSlotSt || {}); } catch (eSK) { reqOwnerOk = false; }
+      }
+    }
+
     let res;
     let retried = false;
     let recoveryCookies = []; /* v6.4: fresh set-cookies gathered below */
-    /* ---- v6.10: navigation-chain mode -----------------------------------
-     * The pocket's document loader sends x-ohp-nav: 1 on every page load
-     * (link clicks, form submits, SPA redirects — the entire OAuth
-     * sign-in chain). A cross-origin fetch() cannot inspect the 30x hops
-     * it follows (opaque-redirect), and a file:// pocket often cannot
-     * store this origin's partitioned cookies at all — so every
-     * Set-Cookie living on an INTERMEDIATE hop (Keycloak AUTH_SESSION_ID,
-     * GitHub session cookies, the app session the FastAPI OAuth callback
-     * sets mid-chain) used to vanish between hops: the IdP flow looped
-     * (auth pages "flashing") and a finished sign-in landed back on the
-     * login page, logged out, forever. Here the WORKER walks the chain
-     * itself: each hop's Set-Cookies are folded into the next hop's
-     * Cookie header (freshest wins) and collected, and the FINAL
-     * response carries the union on x-set-cookie — the pocket's jar (and
-     * the sandbox it boots from frame.name) heals in one shot. */
-    const navMode = (req.headers.get('x-ohp-nav') || '') === '1' && !needDuplex;
-    const chainCookies = []; /* raw Set-Cookie strings from every followed hop */
-    const chainHosts = [];  /* distinct upstream hosts visited, for diagnostics */
-    const chainTrace = [];  /* v6.11: "<status> <url>" per hop — x-ohp-hops, so the
-                             * pocket's error card can show the EXACT failing hop
-                             * instead of the URL the sandbox guessed it loaded */
-    const CHAIN_MAX_HOPS = 20;
-    const rawSetCookies = (r) => {
+    /* ---- v7.0: an explicit in-app sign-out forgets the relay-held
+     * session (GET /api/v1/auths/signout — verified in the app's own
+     * bundle). NOTHING else may ever drop it: boot flailing, guest
+     * sessions, new pages and wiped phones must all stay inert
+     * ("I don't want any chance of me getting logged out from a new
+     * page"). The request itself still goes through untouched, so
+     * z.ai kills its side of the session too.
+     * v7.1: only the OWNER's signout forgets — a stranger signing
+     * out of their own guest session inside this relay must never
+     * touch the owner's slot. */
+    const isSignoutCall = host === appHost(event) && (/^\/api\/(auth\/)?logout\/?$/.test(upUrl.pathname) || /^\/logout\/?$/.test(upUrl.pathname));
+    if (isSignoutCall && reqOwnerOk) {
       try {
-        if (typeof r.headers.getSetCookie === 'function') return r.headers.getSetCookie();
-        const single = r.headers.get('set-cookie');
-        return single ? [single] : [];
-      } catch (e) { return []; }
-    };
-    /* ---- transient refusal retry (reads only) ---------------------------
-     * A 403/429 occasionally comes from WAF-style edge rules fed by
-     * leftover request headers rather than real auth or rate state. One
-     * clean minimal-header attempt (app-style origin/referer, no
-     * forwarded edge headers) recovers those; anything that survives it
-     * is a real answer and passes through untouched. OpenHands auth
-     * failures (401) are NOT retried — an expired token will not heal in
-     * place, and the app's own login flow owns it. v6.11: 404 joins the
-     * set for GET/HEAD hops — github.com/login/oauth/authorize has been
-     * observed answering a plain-text 404 "Not Found" to worker egress
-     * (bot mitigation on the datacenter IP) while the same path serves
-     * 302/200 to a clean request; one minimal-header retry rescues the
-     * whole sign-in chain. */
-    const hopRetry = async (r, u, m) => {
-      if ((r.status === 403 || r.status === 429 || r.status === 404) && (m === 'GET' || m === 'HEAD')) {
-        try {
-          const r2 = await fetch(u, { method: m, headers: minimalHeaders(req, new URL(u).host), redirect: 'manual' });
-          retried = true; /* a retry attempt happened — tagged either way */
-          if (r2.status !== r.status) {
-            try { if (r.body && r.body.cancel) r.body.cancel(); } catch (e) { /* ignore */ }
-            return r2;
-          }
-          try { if (r2.body && r2.body.cancel) r2.body.cancel(); } catch (e) { /* ignore */ }
-        } catch (e2) { /* keep the original response */ }
-      }
-      return r;
-    };
+        const pForget = (async function () {
+          try { await caches.default.delete(await sessionKeyUrl()); } catch (eFd) { /* idempotent */ }
+        })();
+        if (event && typeof event.waitUntil === 'function') { try { event.waitUntil(pForget); } catch (eWf) { pForget.catch(function () { }); } }
+        else pForget.catch(function () { });
+      } catch (eFo) { /* best effort */ }
+    }
     try {
-      if (navMode) {
-        let curUrl = new URL(upUrl.toString());
-        let curMethod = method;
-        let curBody = body; /* ArrayBuffer — replayable on 307/308 redirects */
-        for (let hop = 0; hop <= CHAIN_MAX_HOPS; hop++) {
-          h.set('origin', 'https://' + curUrl.host);
-          h.set('referer', 'https://' + curUrl.host + '/');
-          /* chain-collected cookies are the freshest — mergeCookieList
-           * eats them LAST so they win over jar and browser cookies */
-          h.set('cookie', mergeCookieList([req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''], chainCookies));
-          if (curMethod === 'GET' || curMethod === 'HEAD') {
-            h.delete('content-length');
-            h.delete('content-type');
-            curBody = undefined;
-          } else if (curBody !== undefined) {
-            h.set('content-length', String(curBody.byteLength));
+      const fetchInit = { method: method, headers: h, redirect: 'manual' };
+      if (body !== undefined) fetchInit.body = body;
+      if (needDuplex) fetchInit.duplex = 'half';
+      res = await fetch(upUrl.toString(), fetchInit);
+      /* ---- session recovery for /api/ calls --------------------------
+       * OpenHands Cloud answers 401/403 whenever the cookie jar is
+       * stale or missing (a wiped phone, a cold boot racing the seed,
+       * a dead Bearer). The relay HOLDS the owner's freshest session
+       * (captured passively), so recover SERVER-SIDE, invisible to
+       * the app: merge the held jar (+ the held Bearer when one
+       * exists) into a clean retry. Reads always; POSTs with
+       * replayable (buffered) bodies too. A 401 that survives the
+       * jar merge gets one more attempt with Authorization dropped —
+       * the cookie session carries the call. Non-/api/ paths keep
+       * the v3 one-shot clean-header retry (WAF trip-wire). */
+      const isAppApi = host === appHost(event) && /^\/api\//.test(upUrl.pathname);
+      const isRead = method === 'GET' || method === 'HEAD';
+      const postReplay = !isRead && isAppApi && res.status !== 429 &&
+        body != null && typeof body.byteLength === 'number';
+      if ((res.status === 401 || res.status === 403 || res.status === 429) && (isRead || postReplay)) {
+        try {
+          const scFirst = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+          if (isAppApi && res.status !== 429) {
+            /* the held session is the owner's best recovery material —
+             * the client's own credentials are what just failed.
+             * OWNER rule: a request without the owner key recovers
+             * with its own credentials only (a stranger's 401 must
+             * never be answered with the owner's session — that
+             * would BE the account leak). */
+            let heldR = null;
+            try { heldR = await sessionRead(); } catch (eHR) { heldR = null; }
+            const heldUserR = !!(reqOwnerOk && heldR && ((heldR.jar && Object.keys(heldR.jar).length) || heldR.token));
+            let heldJarR = '';
+            if (heldUserR) {
+              try { heldJarR = Object.keys(heldR.jar || {}).map((n) => n + '=' + heldR.jar[n]).join('; '); } catch (eJR) { heldJarR = ''; }
+            }
+            const ck = mergeCookieList(
+              [mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''), heldJarR], scFirst);
+            const h2 = minimalHeaders(req, host);
+            if (ck) h2.set('cookie', ck);
+            /* the held session's Bearer beats the client's own
+             * (which just failed); without one, keep the original. */
+            const authz = req.headers.get('authorization');
+            if (heldUserR && heldR.token) h2.set('authorization', 'Bearer ' + heldR.token);
+            else if (authz) h2.set('authorization', authz);
+            const retryInit = { method: method, headers: h2, redirect: 'manual' };
+            if (!isRead) {
+              retryInit.body = body;
+              const rct = req.headers.get('content-type');
+              if (rct) h2.set('content-type', rct);
+            }
+            let res2 = await fetch(upUrl.toString(), retryInit);
+            retried = true; /* a retry attempt happened — tagged either way */
+            /* a 401 that SURVIVES the jar refresh means the Bearer
+             * itself is stale — retry once with it dropped; the cookie
+             * session carries the call. Tag the success so the runtime
+             * patch clears the stale key from its storage. */
+            let dropAuth = false;
+            if (res2.status === 401 && authz) {
+              try {
+                const h3 = new Headers(h2);
+                h3.delete('authorization');
+                const retryInit3 = { method: method, headers: h3, redirect: 'manual' };
+                if (!isRead) retryInit3.body = body;
+                const res3 = await fetch(upUrl.toString(), retryInit3);
+                if (res3.status !== res2.status) {
+                  try { if (res2.body && res2.body.cancel) res2.body.cancel(); } catch (eC2) { /* ignore */ }
+                  res2 = res3;
+                  dropAuth = true;
+                } else {
+                  try { if (res3.body && res3.body.cancel) res3.body.cancel(); } catch (eC3) { /* ignore */ }
+                }
+              } catch (e3b) { /* keep the stage-1 response */ }
+            }
+            if (res2.status !== res.status) {
+              try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e) { /* ignore */ }
+              res = res2;
+              recoveryCookies = scFirst;
+              retried = dropAuth ? 'dropauth' : true;
+            } else {
+              try { if (res2.body && res2.body.cancel) res2.body.cancel(); } catch (e) { /* ignore */ }
+            }
+          } else {
+            /* ---- everything else — retry ONCE with a minimal, clean
+             * header set before relaying the block page. ---- */
+            const res2 = await fetch(upUrl.toString(), { method: method, headers: minimalHeaders(req, host), redirect: 'manual' });
+            retried = true; /* a retry attempt happened — tagged either way */
+            if (res2.status !== res.status) {
+              try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e) { /* ignore */ }
+              res = res2;
+              retried = true;
+            } else {
+              try { if (res2.body && res2.body.cancel) res2.body.cancel(); } catch (e) { /* ignore */ }
+            }
           }
-          const fi = { method: curMethod, headers: h, redirect: 'manual' };
-          if (curBody !== undefined && curMethod !== 'GET' && curMethod !== 'HEAD') fi.body = curBody;
-          res = await fetch(curUrl.toString(), fi);
-          res = await hopRetry(res, curUrl.toString(), curMethod);
-          chainTrace.push(res.status + ' ' + curUrl.toString().slice(0, 400));
-          if (chainHosts.indexOf(curUrl.host) < 0) chainHosts.push(curUrl.host);
-          const st = res.status;
-          const loc2 = res.headers.get('location');
-          const isRedir = !!(loc2 && st >= 300 && st < 400 && st !== 304);
-          if (!isRedir) break; /* the chain's final answer */
-          rawSetCookies(res).forEach((sc) => { if (sc) chainCookies.push(sc); });
-          let abs = null;
-          try { abs = new URL(loc2, curUrl); } catch (eL) { abs = null; }
-          if (!abs || (abs.protocol !== 'https:' && abs.protocol !== 'http:')) break; /* unfollowable — degrade to the plain 30x path below */
-          if (hop === CHAIN_MAX_HOPS) {
-            const rh502 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-            rh502.set('x-ohp-up', curUrl.toString());
-            rh502.set('x-ohp-hops', encodeURIComponent(chainTrace.join(' | ')));
-            rh502.set('x-ohp-errbody', encodeURIComponent('The sign-in flow bounced between ' + chainHosts.join(', ') +
-              ' without finishing — an SSO/identity-provider page is likely refusing the relay. Tap Retry, or sign in with a different method.'));
-            return new Response(JSON.stringify({ error: 'redirect chain too long', hosts: chainHosts }), { status: 502, headers: corsHeaders(req, rh502) });
-          }
-          if (!hostAllowed(abs.host, event)) {
-            const rh502 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-            rh502.set('x-ohp-up', curUrl.toString());
-            rh502.set('x-ohp-hops', encodeURIComponent(chainTrace.join(' | ')));
-            rh502.set('x-ohp-errbody', encodeURIComponent('The sign-in flow tried to leave the relay to ' + abs.host +
-              ' — that host is not in the worker allowlist. Add it to the EXTRA_HOSTS variable (comma-separated) in this Cloudflare worker and try again.'));
-            return new Response(JSON.stringify({ error: 'redirect to unallowed host', host: abs.host, hint: 'add EXTRA_HOSTS to the worker env', visited: chainHosts }), { status: 502, headers: corsHeaders(req, rh502) });
-          }
-          if (st === 303 || ((st === 301 || st === 302) && curMethod !== 'GET' && curMethod !== 'HEAD')) {
-            curMethod = 'GET'; /* fetch semantics: POST becomes GET on 301/302/303 */
-            curBody = undefined;
-          }
-          /* 307/308 keep method + body */
-          curUrl = abs;
-        }
-        /* the chain resolved: everything downstream (HTML rewrite, JS
-         * rewrite, x-final-url, 4xx diagnostics) must describe the FINAL
-         * document, not the entry hop */
-        upUrl = curUrl;
-        host = curUrl.host;
-        if (!tokMode) pfx = prefixForHost(host, event);
-      } else {
-        const fetchInit = { method: method, headers: h, redirect: 'manual' };
-        if (body !== undefined) fetchInit.body = body;
-        if (needDuplex) fetchInit.duplex = 'half';
-        res = await fetch(upUrl.toString(), fetchInit);
-        res = await hopRetry(res, upUrl.toString(), method);
+        } catch (e2) { /* keep the original response */ }
       }
     } catch (err) {
       return json({ error: 'upstream fetch failed', detail: String(err && err.message || err) }, req, 502);
     }
 
-    /* ---- redirect handling: rewrite Location and let the browser follow inside the worker ----
-     * Plain mode hands every 30x back to the caller (mapped to a worker
-     * path, cookies re-issued). Navigation chains normally never get
-     * here — the loop above already consumed them — this is the
-     * unfollowable edge (unparseable target / non-http scheme)
-     * degrading gracefully. */
+    /* ---- passive session capture (the relay keeps the sign-in).
+     * Reads only headers (set-cookie) + the request's Bearer, plus a
+     * small JSON clone when this response IS an identity answer — the
+     * original response body is never consumed. Runs via waitUntil so
+     * the proxy answer is never delayed by the cache write.
+     * OpenHands truth (the auths-equivalent):
+     *   - GET /api/organizations/{orgId}/me -> {user_id, email, role}
+     *     (the definitive USER identity answer — this is what claims
+     *     a fresh slot in auto mode);
+     *   - POST /api/authenticate -> 200 means the cookie session is
+     *     LIVE (the app's own session check);
+     *   - the session itself rides on set-cookie headers, captured
+     *     from every proxied response;
+     *   - a Bearer (an OpenHands API key) may ride on API calls.
+     * The signout call itself is never captured (its session is dead
+     * by design — it must not resurrect into the slot).
+     * Capture is OWNER-ONLY (x-ohp-owner matched or a fresh-slot
+     * claim) — a guest or a stranger signing into THEIR account
+     * through this relay must never write (let alone overwrite) the
+     * owner's slot. AUTO claim rules (keyed mode is 7.1):
+     *   - carrying the slot's key (or the master key) -> full owner
+     *     rights: capture jar, tokens, identity, everything;
+     *   - keyless USER identity on an unclaimed slot (no key, no
+     *     held session) -> CLAIM: mint a key, capture, stamp the key;
+     *   - keyless USER identity for the SAME account as the held
+     *     session (wiped phone, new device) -> capture + re-issue
+     *     the existing key (stamped) — automatic recovery;
+     *   - a keyless authenticated session on a VIRGIN slot (the
+     *     sign-in landed, identity answer still in flight) -> hold
+     *     the jar WITHOUT claiming — the app boots signed in, the
+     *     identity answer that follows claims properly;
+     *   - anything else -> no capture, no stamp: a plain guest
+     *     proxy answer. */
+    let claimStamp = '';
+    try {
+      if (host === appHost(event) && !isSignoutCall) {
+        const scAll = (typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []).concat(recoveryCookies || []);
+        let authsObj = null;
+        let authLive = false;
+        const identityGet = method === 'GET' && /^\/api\/organizations\/[^/]+\/me\/?$/.test(upUrl.pathname);
+        const authCheck = method === 'POST' && /^\/api\/authenticate\/?$/.test(upUrl.pathname);
+        if (res.status === 200 && (identityGet || authCheck) &&
+            (res.headers.get('content-type') || '').toLowerCase().includes('json')) {
+          try {
+            const probe = res.clone();
+            const aj = JSON.parse(await probe.text());
+            if (identityGet && aj && aj.user_id) {
+              authsObj = { token: '', id: String(aj.user_id), role: String(aj.role || 'user'), em: String(aj.email || ''), nm: '' };
+            } else if (authCheck && aj && (aj.authenticated === true || aj.ok === true || aj.user_id)) {
+              authLive = true;
+            }
+          } catch (ePr) { authsObj = null; }
+        }
+        let bearer = '';
+        const authzCap = req.headers.get('authorization') || '';
+        const mB = authzCap.match(/^\s*Bearer\s+(\S+)\s*$/i);
+        if (mB) bearer = mB[1];
+        /* ---- the AUTO rights + claim decision ---- */
+        let capOk = reqOwnerOk; /* keyed mode (or key-carrying owner): decided above */
+        let claimKey = '';
+        if (!reqMasterSet) {
+          const st = reqSlotSt || await sessionRead();
+          const userAo = !!(authsObj && authsObj.id);
+          const liveAo = userAo || authLive;
+          if (!reqOwnerOk && liveAo) {
+            const hasKey = !!(st && st.key);
+            const heldUser = !!(st && st.role && st.role !== 'guest' && st.id);
+            const sameAcct = !!(userAo && st && String(authsObj.id) === String(st.id || ''));
+            if (!hasKey && !heldUser) {
+              /* fresh relay: the first USER sign-in claims it — a
+               * definitive identity answer OR a live authenticated
+               * session (POST /api/authenticate 200 with cookies this
+               * relay itself validated upstream; the zp original
+               * claimed on signin/signup answers the same way) */
+              capOk = true;
+              claimKey = newSlotKey();
+            } else if (!heldUser || sameAcct) {
+              /* (!heldUser) a keyed slot whose identity has not landed
+               * yet — the first identity through fills it and the key
+               * rides home again (the claim answer may have beaten
+               * the shell's key push here — this closes that race).
+               * (sameAcct) the account holder returning keyless
+               * (wipe, new device): re-issue THIS slot's key. */
+              capOk = true;
+              claimKey = (st && st.key) || newSlotKey();
+            }
+            /* else: a foreign account on a live slot — guest only */
+          }
+        }
+        if (capOk && (scAll.length || bearer || authsObj || authLive)) {
+          const pCap = sessionCapture(req, bearer, scAll, authsObj, claimKey ? { claimKey: claimKey } : null);
+          if (event && typeof event.waitUntil === 'function') { try { event.waitUntil(pCap); } catch (eWu) { pCap.catch(function () { }); } }
+          else pCap.catch(function () { });
+          if (claimKey) claimStamp = claimKey;
+        }
+      }
+    } catch (eSC) { /* capture must never break the proxy */ }
+
+    /* ---- redirect handling: rewrite Location and let the browser follow inside the worker ---- */
     const loc = res.headers.get('location');
     if (loc && res.status >= 300 && res.status < 400 && res.status !== 304) {
       const mapped = mapLocation(loc, upUrl, event, tokMode);
       const rh = scrubHeaders(res.headers);
       reissueCookies(res, rh, event);
-      reissueRawCookies(recoveryCookies.concat(chainCookies), rh); /* v6.4 recovery + v6.10 chain cookies ride along */
+      reissueRawCookies(recoveryCookies, rh); /* v6.4 recovery cookies ride along */
       rh.set('location', mapped);
       maybeSetTokenCookie(req, rh, event);
       return new Response(null, { status: res.status, headers: corsHeaders(req, rh) });
@@ -2413,31 +2928,27 @@ async function handle(req, event) {
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const outHeaders = scrubHeaders(res.headers);
     reissueCookies(res, outHeaders, event);
-    /* v6.4 recovery cookies + v6.10 the whole sign-in chain's cookies ride along */
-    reissueRawCookies(recoveryCookies.concat(chainCookies), outHeaders);
+    reissueRawCookies(recoveryCookies, outHeaders); /* v6.4 recovery cookies ride along */
     maybeSetTokenCookie(req, outHeaders, event);
     outHeaders.set('x-final-url', res.url || upUrl.toString());
-    if (navMode && chainTrace.length) {
-      try { outHeaders.set('x-ohp-hops', encodeURIComponent(chainTrace.join(' | '))); } catch (eTr) { /* never let tracing break a response */ }
-    }
-    if (retried) outHeaders.set('x-ohp-retry', (retried === 'dropauth' || retried === 'capacity') ? retried : '1');
+    if (retried) outHeaders.set('x-ohp-retry', (retried === 'dropauth' || retried === 'capacity' || retried === 'sticky') ? retried : '1');
+    /* v7.2: the minted (or re-issued) slot key rides THIS response to
+     * the client that just signed in — the pocket's runtime patch
+     * reads it, saves it, and rides it from the next request on. */
+    if (claimStamp) outHeaders.set('x-ohp-claim', claimStamp);
     const outCt = corsHeaders(req, outHeaders);
 
     if (ct.includes('text/html')) {
+      /* v6.2: filebin (delivery host) labels EVERY file text/html — the
+       * pocket payload must pass through byte-exact, never rewritten. */
+      const isFb = host === 'filebin.net' || String(host || '').toLowerCase().endsWith('.filebin.net');
+      if (isFb) {
+        return new Response(res.body, { status: res.status, headers: outCt });
+      }
       const text = await res.text();
       const html = rewriteHtml(text, pfx, host, new URL(req.url).origin, token, allowList(event),
         tokMode ? upUrl.toString() : null);
       const htmlRes = new Response(html, { status: res.status, headers: outCt });
-      /* ---- v6.9: failure diagnostics ------------------------------------
-       * A 4xx/5xx DOCUMENT (an IdP or upstream refusing a relayed step)
-       * carries a short escaped body snippet so the pocket's error card
-       * can say WHICH upstream failed and WHY, instead of a bare number. */
-      try {
-        if (res.status >= 400) {
-          htmlRes.headers.set('x-ohp-errbody', encodeURIComponent(String(text).replace(/\s+/g, ' ').slice(0, 240)));
-          htmlRes.headers.set('x-ohp-up', upUrl.toString());
-        }
-      } catch (eErrBody) { /* never let diagnostics break a document */ }
       /* ---- v6.7: boot cookie-seed ---------------------------------------
        * When the pocket's document fetch arrived with REAL browser
        * cookies for this worker (credentials:'include' mode), the
@@ -2459,7 +2970,7 @@ async function handle(req, event) {
             const eq = kv.indexOf('=');
             if (eq < 1) return;
             const name = kv.slice(0, eq).trim();
-            if (!name || name === '__ohp_t' || have.has(name)) return;
+            if (!name || name === '__ohp_t' || name === 'zp_dev' || have.has(name)) return;
             if (/^(cf_|__cf|_ga|_gat|_gid|__utm)/i.test(name)) return;
             seeds.push({ name: name, value: kv.slice(eq + 1).trim() });
           });
@@ -2472,19 +2983,6 @@ async function handle(req, event) {
       const text = await res.text();
       const css = rewriteCss(text, pfx, host, allowList(event), tokMode ? upUrl.toString() : null, new URL(req.url).origin);
       return new Response(css, { status: res.status, headers: outCt });
-    }
-    /* ---- v6.9: buffered error bodies (JSON/plain) ---------------------
-     * Upstream 4xx/5xx JSON (FastAPI {"detail":...}, OAuth errors) is the
-     * other shape a failed document load lands on; buffer it, attach the
-     * diagnostic headers, and pass it through. */
-    if (res.status >= 400 && (ct.includes('json') || ct.includes('text/plain'))) {
-      const text = await res.text();
-      const h2 = new Headers(outCt);
-      try {
-        h2.set('x-ohp-errbody', encodeURIComponent(String(text).replace(/\s+/g, ' ').slice(0, 240)));
-        h2.set('x-ohp-up', upUrl.toString());
-      } catch (eErrB2) { /* ignore */ }
-      return new Response(text, { status: res.status, headers: h2 });
     }
     /* ---- v5: JavaScript location-assignment rewrite ----------------
      * Inside the sandbox frame the document lives at about:srcdoc; a
@@ -2501,8 +2999,7 @@ async function handle(req, event) {
      * entire bundle at parse time. */
     if (tokMode && /javascript|ecmascript|text\/jscript/i.test(ct)) {
       const text = await res.text();
-      let js = rewriteJsLocation(text);
-      js = rewriteJsImports(js, upUrl.toString(), new URL(req.url).origin);
+      const js = rewriteJsLocation(text);
       if (js !== text) {
         const h2 = new Headers(outCt);
         h2.set('x-ohp-jsrw', '1');
@@ -2531,7 +3028,7 @@ async function handle(req, event) {
 /* ============================================================ helpers */
 
 function envOf(event) {
-  return (event && event.env) || globalThis.__OHP_ENV || {};
+  return (event && event.env) || globalThis.__OH_ENV || {};
 }
 function allowList(event) {
   const extra = envOf(event).EXTRA_HOSTS || '';
@@ -2575,12 +3072,18 @@ function maybeSetTokenCookie(req, h, event) {
 
 function mergeCookies(a, b) {
   const seen = new Map();
+  /* this worker's OWN cookies never belong upstream — __ohp_t is
+   * the token cookie and zp_dev a 6.8-era device-vault leftover
+   * some phones may still hold; both live on the relay origin
+   * only and must not ride to z.ai. */
+  const own = new Set(['zp_dev', '__ohp_t']);
   const add = (str) => {
     if (!str) return;
     str.split(';').forEach((kv) => {
       kv = kv.trim();
       if (!kv) return;
       const name = kv.split('=')[0];
+      if (own.has(name)) return;
       if (!seen.has(name)) seen.set(name, kv);
     });
   };
@@ -2688,7 +3191,7 @@ function reissueRawCookies(raw, h) {
 }
 
 function corsHeaders(req, h) {
-  /* v6.1: credentialed CORS for EVERY caller. The app calls
+  /* v6.1: credentialed CORS for EVERY caller. The z.ai app calls
    * EVERY api with credentials:"include" — and a browser REFUSES
    * Access-Control-Allow-Origin:* on credentialed cross-origin fetches,
    * which silently killed signin / chat-send inside the sandbox while
@@ -2717,7 +3220,7 @@ function corsHeaders(req, h) {
   h.set('access-control-allow-methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
   const reqH = req.headers.get('access-control-request-headers');
   h.set('access-control-allow-headers', reqH || '*');
-  h.set('access-control-expose-headers', 'content-disposition, content-type, location, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-errbody, x-ohp-up, x-ohp-hops');
+  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-claim');
   h.set('access-control-max-age', '86400');
   return h;
 }
@@ -2736,7 +3239,7 @@ function minimalHeaders(req, host) {
   if (al) h.set('accept-language', al);
   h.set('accept', req.headers.get('accept') || '*/*');
   h.set('accept-encoding', 'gzip, deflate, br');
-  const ck = mergeCookies(req.headers.get('x-cookie') || '', req.headers.get('cookie') || ''); /* v6.10: jar wins, browser fills gaps */
+  const ck = mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || '');
   if (ck) h.set('cookie', ck);
   h.set('origin', 'https://' + host);
   h.set('referer', 'https://' + host + '/');
@@ -2747,7 +3250,7 @@ function minimalHeaders(req, host) {
  *
  * Three GETs against the chat upstream, each shaped like a
  * different worker generation, so the page shows exactly WHICH
- * request style the upstream blocks (if any) from this worker's egress:
+ * request style z.ai blocks (if any) from this worker's egress:
  *   1. "app"     — what v3 forwards for the app document
  *                  (browser-like, CF edge headers stripped)
  *   2. "minimal" — accept + user-agent + origin/referer only
@@ -2818,17 +3321,17 @@ async function diagPage(req, event) {
   let verdict, verdictColor;
   if (app.error || app.status !== 200) {
     if (!app.error && (app.status === 403 || app.status === 429)) {
-      verdict = 'OpenHands is BLOCKING this worker\u2019s requests (HTTP ' + app.status + '). That block page is what the app shows. Send this whole page to whoever helps you.';
+      verdict = 'OpenHands Cloud is BLOCKING this worker\u2019s requests (HTTP ' + app.status + '). That block page is what the app shows. Send this whole page to whoever helps you.';
       verdictColor = '#F87171';
     } else {
       verdict = 'The worker could not fetch the app page from ' + esc(appHost(event)) + ' (' + esc(app.error ? app.detail : 'HTTP ' + app.status) + '). The app cannot work until this is fixed.';
       verdictColor = '#F87171';
     }
   } else if (!forged.error && (forged.status === 403 || forged.status === 429)) {
-    verdict = 'OpenHands answers normally, but blocks the OLD v2-style request (with forwarded Cloudflare headers). Your v3 fix is exactly right \u2014 keep it deployed.';
+    verdict = 'OpenHands Cloud answers normally, but blocks the OLD v2-style request (with forwarded Cloudflare headers). Your v3 fix is exactly right \u2014 keep it deployed.';
     verdictColor = '#FBBF24';
   } else {
-    verdict = 'OpenHands answers this worker normally. If the app still shows a block page, the block is NOT between this worker and the upstream \u2014 it is between your phone and this worker (network filter / browser). Try this page from a different network (Wi-Fi vs mobile data) to compare.';
+    verdict = 'OpenHands Cloud answers this worker normally. If the app still shows a block page, the block is NOT between this worker and the cloud \u2014 it is between your phone and this worker (network filter / browser). Try this page from a different network (Wi-Fi vs mobile data) to compare.';
     verdictColor = '#4ADE80';
   }
 
@@ -2870,7 +3373,7 @@ async function diagPage(req, event) {
     '<div class="card"><b>What your request arrived with</b>' +
     (incoming.length ? '<ul>' + incoming.map((l) => '<li>' + esc(l) + '</li>').join('') + '</ul>' :
       '<ul><li>(no Cloudflare edge headers seen \u2014 this request did not come through a Cloudflare edge)</li></ul>') +
-    '<div class="foot">These headers were what v2 wrongly forwarded to the app. v3 strips them; Probe 3 shows what the app thinks of them.</div></div>' +
+    '<div class="foot">These headers were what v2 wrongly forwarded upstream. v3 strips them; Probe 3 shows what the cloud thinks of them.</div></div>' +
     '<div class="foot">This page made three live calls to ' + esc(appUpstream(event)) + '/ from inside the worker. It works with or without the PROXY_TOKEN, in any cookie state.</div>' +
     '</body></html>';
 
@@ -3010,12 +3513,6 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
       return pre + '"' + nv.replace(/"/g, '&quot;') + '"';
     });
 
-    /* v1 (OpenHands): root-absolute import specifiers inside inline boot
-     * scripts (import"/assets/x.js", import("…"), …from"/…") must become
-     * absolute /__o/ handles before the srcdoc swap — see
-     * rewriteJsImports. */
-    if (tokDoc) text = rewriteJsImports(text, tokDoc, workerOrigin);
-
     /* inject config + runtime patch as the first script; v6 also injects
      * a <base> pointing at this document's /__o/ mirror — the sandbox
      * document sits at about:srcdoc where relative URLs resolve against
@@ -3026,7 +3523,7 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
      * reports the upstream URL to the app, so routers hydrate right. */
     const cfg = { pfx: pfx, host: host, worker: workerOrigin, token: token || '', allow: allow,
       key: TOK_KEY, tok: !!tokDoc, doc: tokDoc || '', sd: !!tokDoc };
-    let inject = '<scr' + 'ipt>window.__OHP__=' + JSON.stringify(cfg) + ';' + PATCH_JS + '</scr' + 'ipt>';
+    let inject = '<scr' + 'ipt>window.__OH__=' + JSON.stringify(cfg) + ';' + PATCH_JS + '</scr' + 'ipt>';
     if (tokDoc) {
       try {
         const bOp = oTokPath(tokDoc);
@@ -3049,63 +3546,13 @@ function rewriteCss(text, pfx, host, allow, tokDoc, workerOrigin) {
       return nu === u ? w : 'url("' + nu + '")';
     });
     text = text.replace(/@import\s*(['"])([^'"]+)\1/gi, (w, q, u) => {
-      /* \s* — some CDNs ship minified css like @import"https://…";
+      /* \s* — z.ai's CDN ships minified css like @import"https://…";
        * with NO space and NO parens. That exact form leaked the
        * upstream hostname straight to the browser once. */
       const nu = mapAttr(u, pfx, host, allow, tokDoc, workerOrigin);
       return nu === u ? w : '@import "' + nu + '"';
     });
     return text;
-  } catch (e) {
-    return text;
-  }
-}
-
-/* ---------------- v1: Vite import-specifier rewrite ----------------
- * OpenHands' Vite build emits ROOT-ABSOLUTE module specifiers
- * ("/assets/chunk-xyz.js") in the boot HTML's inline scripts, in its
- * served module files, and — critically — as DATA inside the route
- * manifest ("module":"/assets/root-landing.js"), which React Router
- * feeds to a dynamic import(VARIABLE) no textual rewrite can reach.
- * Served through /__o/ the resolving base's origin is the WORKER, so
- * an unrewritten "/assets/…" reference resolves to
- * https://worker/assets/… — the neutral 404 — and the route graph
- * dies before the app paints a pixel. Three conservative patterns:
- *   import("/assets/x.js") · import"/assets/x.js" · from"/assets/x.js"
- * plus a standalone-string pass: ANY quoted root-absolute
- * .js/.mjs/.css path (the manifest's module/imports values, preload
- * href arrays, __vitePreload deps) is re-pointed at the ABSOLUTE
- * /__o/ handle for the same upstream path — dynamic import() accepts
- * absolute URLs, so variable-driven imports are healed at the source.
- * Only applied in tokDoc (sandbox) mode. */
-function rewriteJsImports(text, tokDoc, workerOrigin) {
-  try {
-    if (!tokDoc || !/["']\/[^"']+\.(?:m?js|css)["']/.test(text)) return text;
-    const wo = workerOrigin ? String(workerOrigin).replace(/\/$/, '') : '';
-    const fix = (p) => {
-      try {
-        const abs = new URL(p, tokDoc);
-        const op = oTokPath(abs.toString());
-        return op ? (wo ? wo + op : op) : p;
-      } catch (e) { return p; }
-    };
-    let out = text;
-    /* dynamic import("/assets/x.js") */
-    out = out.replace(/\bimport\s*\(\s*(["'])(\/[^"')]+\.(?:m?js|css))\1/g,
-      (w, q, p) => 'import(' + q + fix(p) + q);
-    /* bare import "/assets/x.js" — covers import"/x.js" with no space too */
-    out = out.replace(/(?<![.\w$])import\s*(["'])(\/[^"']+\.(?:m?js|css))\1/g,
-      (w, q, p) => 'import ' + q + fix(p) + q);
-    /* …from "/assets/x.js" */
-    out = out.replace(/(?<![.\w$])from\s*(["'])(\/[^"']+\.(?:m?js|css))\1/g,
-      (w, q, p) => 'from ' + q + fix(p) + q);
-    /* standalone root-absolute asset-path STRINGS (manifest data,
-     * preload arrays, runtime href values): import(variable) and
-     * link-creation consume these — absolute worker URLs are exactly
-     * what both need. */
-    out = out.replace(/(["'])(\/[A-Za-z0-9][A-Za-z0-9._\/-]*\.(?:m?js|css))\1/g,
-      (w, q, p) => q + fix(p) + q);
-    return out;
   } catch (e) {
     return text;
   }
@@ -3131,10 +3578,10 @@ function rewriteJsImports(text, tokDoc, workerOrigin) {
  * v6.6 adds TWO shapes the original pass missed:
  *   (a) optional chaining — `location?.href` / `window.location?.hash`
  *   (b) WHOLE-OBJECT reads — `(t = window.location) == null ? void 0 :
- *       t.hostname` — the compiled form some bundles use for the
+ *       t.hostname` — the compiled form the z.ai bundle uses for the
  *       captcha SCENE_ID getter. Left raw, `window.location` in the
  *       sandbox is about:srcdoc (hostname ""), and every captcha token
- *       was minted for the wrong scene, so every solve was rejected. */
+ *       was minted for the wrong scene, so z.ai rejected every solve. */
 function rewriteJsLocation(text) {
   try {
     if (!/location\b/.test(text)) return text;
@@ -3142,7 +3589,7 @@ function rewriteJsLocation(text) {
     /* member forms, prefixed (window/document/self/top/parent/globalThis).
      * v6.6: `location?.` (optional chain) rewrites the same way —
      * __ohLoc is never null, so the semantics only get more reliable. */
-    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\??\.location\??\.(href|assign|replace|reload|pathname|search|hash|origin|host|hostname|protocol|port|toString)\b/gi,
+    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\.location\??\.(href|assign|replace|reload|pathname|search|hash|origin|host|hostname|protocol|port|toString)\b/gi,
       (w, prop) => '__ohLoc.' + prop);
     /* bare location.<prop> — the leading (?<![.\w$]) stops it from
      * matching x.location.href (nested-frame access) or mylocation.href: */
@@ -3155,7 +3602,7 @@ function rewriteJsLocation(text) {
      *   - (?![.\w$]) — window.locationFoo never matches;
      *   - (?!\s*=(?!=)) — `window.location = X` writes stay REAL
      *     (navigations the shell's escape recovery owns). */
-    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\??\.location(?![.\w$])(?!\s*=(?!=))/g,
+    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\.location(?![.\w$])(?!\s*=(?!=))/g,
       (w) => '__ohLoc');
     return out;
   } catch (e) {
@@ -3165,7 +3612,7 @@ function rewriteJsLocation(text) {
 
 /* ---------------- v5: neutral service page (the root) ----------------
  * Everything a classifier can crawl at this origin must look like a
- * boring uptime page: no product names, no chat UI, no app strings,
+ * boring uptime page: no product names, no chat UI, no z.ai strings,
  * no AI vocabulary. The real app only ever lives behind opaque
  * /__t/<token> fetches. */
 function servicePage(req) {
@@ -3186,7 +3633,7 @@ function servicePage(req) {
 /* ---------------- websocket proxy ---------------- */
 async function proxyWebsocket(req, url, event) {
   try {
-    /* resolve upstream ws url — transparent root form (legacy) */
+    /* resolve upstream ws url — the whole worker mirrors chat.z.ai */
     let target;
     let tokMode = false;
     if (url.pathname.startsWith('/__t/')) {
@@ -3221,7 +3668,7 @@ async function proxyWebsocket(req, url, event) {
     if (t.searchParams.has('__t')) t.searchParams.delete('__t');
 
     const upHeaders = new Headers({ 'Upgrade': 'websocket' });
-    const ck = mergeCookies(req.headers.get('x-cookie') || '', req.headers.get('cookie') || ''); /* v6.10: jar wins, browser fills gaps */
+    const ck = mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || '');
     if (ck) upHeaders.set('cookie', ck);
     upHeaders.set('origin', 'https://' + t.host);
 
@@ -3254,7 +3701,7 @@ function landing(event, bad) {
   const html = '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">' +
     '<meta name="theme-color" content="#0B0D12">' +
-    '<title>zp service — setup</title>' +
+    '<title>ohp service — setup</title>' +
     '<link rel="icon" href="data:image/svg+xml,' + encodeURIComponent(FAVICON_SVG) + '">' +
     '<style>' +
     ':root{--bg:#0B0D12;--panel:#14161F;--panel2:#1A1D28;--line:rgba(255,255,255,.08);--txt:#E7E9EE;--sub:#9AA1AD;--acc:#6E6AF8;--bad:#F87171}' +
@@ -3278,7 +3725,7 @@ function landing(event, bad) {
     '.hint b{color:var(--txt)}' +
     '</style></head><body><div class="card">' +
     '<div class="logoRow"><div class="logo"><svg viewBox="0 0 64 64"><path d="M18 20h28v7H33.5L46 44h-8.5L27 30.5V44h-9z" fill="#fff"/></svg></div>' +
-    '<div><h1>zp service</h1><div class="tag">This endpoint is protected by an access token.</div></div></div>' +
+    '<div><h1>ohp service</h1><div class="tag">This endpoint is protected by an access token.</div></div></div>' +
     (bad ? '<div class="err">That token was not accepted — check it and try again.</div>' : '') +
     '<form method="GET" action="/">' +
     '<label for="t">PROXY TOKEN</label>' +
