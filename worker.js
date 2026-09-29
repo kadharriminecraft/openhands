@@ -23,9 +23,12 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — worker.js
- * BUILD: ohp service 1.0 (the current one-and-only build)
+ * BUILD: ohp service 1.1 (transparent-root fix: the OpenHands app
+ *   boots — inline module imports and the React Router manifest's
+ *   root-absolute /assets/... paths stopped 404ing at the relay root,
+ *   which left the sandbox a blank page)
  *   Deploy check: /__status on the worker URL must answer
- *   "ohp service 1.0" — anything older is a stale copy.
+ *   "ohp service 1.1" — anything older is a stale copy.
  * ------------------------------------------------------------
  * WHAT THIS DOES
  *   A faithful port of the z.ai pocket relay architecture
@@ -143,7 +146,7 @@ const OWNER_KEY = "";
  *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.0';
+const VERSION = 'ohp service 1.1';
 
 /* OpenHands Cloud family + the hosts its sign-in needs (suffix
  * match — covers every subdomain: runtime sandboxes, CDN, auth). */
@@ -229,7 +232,7 @@ function appHost(event) {
 /* markers filled by the build script */
 const PATCH_JS = [
 "/* ============================================================",
-" * z.ai pocket \u2014 runtime patch (v4)",
+" * OpenHands pocket \u2014 runtime patch (v4)",
 " * Injected by the proxy worker into every proxied HTML document",
 " * as the FIRST script inside <head>. It rewrites every network",
 " * call, navigation and popup so the SPA believes it lives on its",
@@ -377,6 +380,48 @@ const PATCH_JS = [
 "        });",
 "      });",
 "    } catch (eD) { /* ignore */ }",
+"    /* v1.1: the URL constructor — the last about:srcdoc leak. Minified",
+"     * routers hold the window in a local parameter (e.location.origin)",
+"     * that the conservative location-token pass must never touch, then",
+"     * build URLs against the sandbox's opaque base:",
+"     *   new URL(path, e.location.href) → new URL(path,'about:srcdoc')",
+"     *   → TypeError: Invalid URL → the app dies on a blank page",
+"     * (React Router 7's createURL is exactly this shape). Wrap URL so",
+"     * the sandbox-poison bases — about:srcdoc / about:blank / the",
+"     * 'null' an opaque origin serializes to — resolve against the",
+"     * CURRENT fake location instead (LOC.u tracks pushState, so SPA",
+"     * transitions keep resolving right). Valid bases are untouched;",
+"     * statics (createObjectURL/revokeObjectURL) ride the class chain",
+"     * and canParse gets the same base fix. */",
+"    try {",
+"      if (window.URL && (DOC || LOC.u)) {",
+"        var RealURL = window.URL;",
+"        var ohBadBase = function (b) {",
+"          try {",
+"            if (b == null) return false;",
+"            var s = (b && typeof b === 'object' && b.href) ? String(b.href) : String(b);",
+"            return /^(about:(srcdoc|blank)|null|undefined)$/i.test(s);",
+"          } catch (eBB) { return false; }",
+"        };",
+"        var ohBase = function () { return (LOC.u && LOC.u.href) ? LOC.u.href : DOC; };",
+"        class PatchedURL extends RealURL {",
+"          constructor(path, base) {",
+"            if (arguments.length >= 2 && ohBadBase(base)) {",
+"              super(path, ohBase());",
+"            } else {",
+"              super(path, base);",
+"            }",
+"          }",
+"        }",
+"        if (typeof RealURL.canParse === 'function') {",
+"          PatchedURL.canParse = function (path, base) {",
+"            if (arguments.length >= 2 && ohBadBase(base)) return RealURL.canParse(path, ohBase());",
+"            return RealURL.canParse(path, base);",
+"          };",
+"        }",
+"        window.URL = PatchedURL;",
+"      }",
+"    } catch (eU2) { /* keep native URL */ }",
 "  }",
 "",
 "  /* ---------- v5/v7.4: boot hydration ----------------------------------",
@@ -2568,11 +2613,29 @@ async function handle(req, event) {
       pfx = '/p/' + host;
       upstream = 'https://' + host + path + url.search;
     } else {
-      /* v5: bare paths no longer mirror chat.z.ai — the transparent
-       * catch-all is GONE. Nothing navigates to this worker; the only
-       * content route is /__t/<token>. Answer a neutral 404 so the
-       * origin never serves anything classifiable. */
-      return json({ ok: false, service: 'zp', status: 404, note: 'nothing is served at this path' }, req, 404);
+      /* v1.1: transparent root — RESTORED for OpenHands. The app's own
+       * HTML references root-absolute paths from spots no rewriter can
+       * reach: inline module import specifiers (import
+       * "/assets/manifest-x.js") and the React Router manifest's
+       * string module paths, import()-ed at runtime. Root-relative
+       * specifiers ignore the <base> path (a leading / always resolves
+       * to the ORIGIN root), so they landed on the relay root and 404'd
+       * — the module script died and the sandbox stayed a blank page.
+       * On this relay a bare path can only mean the APP upstream:
+       * third-party hosts always arrive tokenized (/__t, /__o), and
+       * the websocket proxy below already routes bare paths exactly
+       * this way. tokMode = true keeps redirects, HTML ref
+       * absolutizing and the JS location pass on /__o handles. */
+      try {
+        const au = new URL(appUpstream(event));
+        const aroot = au.pathname.replace(/\/+$/, '');
+        host = au.host;
+        pfx = '';
+        upstream = au.origin + aroot + url.pathname + url.search;
+        tokMode = true;
+      } catch (eAU) {
+        return json({ ok: false, service: 'ohp', status: 404, note: 'bad APP_UPSTREAM' }, req, 404);
+      }
     }
 
     /* ---- query handling ----
@@ -3586,10 +3649,17 @@ function rewriteJsLocation(text) {
   try {
     if (!/location\b/.test(text)) return text;
     let out = text;
-    /* member forms, prefixed (window/document/self/top/parent/globalThis).
+    /* member forms, prefixed (window/document/self/top/parent/globalThis/global).
      * v6.6: `location?.` (optional chain) rewrites the same way —
-     * __ohLoc is never null, so the semantics only get more reliable. */
-    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\.location\??\.(href|assign|replace|reload|pathname|search|hash|origin|host|hostname|protocol|port|toString)\b/gi,
+     * __ohLoc is never null, so the semantics only get more reliable.
+     * v1.1: `window?.location` — the optional chain BEFORE location — is
+     * the compiled shape OpenHands' axios base uses
+     * (`${window.location.protocol}//${window?.location.host}`); left
+     * raw in the sandbox, location.host is "" and every API call went
+     * to `https:/api/...` (axios' slash-merge) — the login page spun
+     * forever on retrying config fetches. The receiver keyword is
+     * never nullish, so dropping the `?.` is semantically safe. */
+    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\??\.location\??\.(href|assign|replace|reload|pathname|search|hash|origin|host|hostname|protocol|port|toString)\b/gi,
       (w, prop) => '__ohLoc.' + prop);
     /* bare location.<prop> — the leading (?<![.\w$]) stops it from
      * matching x.location.href (nested-frame access) or mylocation.href: */
@@ -3602,8 +3672,26 @@ function rewriteJsLocation(text) {
      *   - (?![.\w$]) — window.locationFoo never matches;
      *   - (?!\s*=(?!=)) — `window.location = X` writes stay REAL
      *     (navigations the shell's escape recovery owns). */
-    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\.location(?![.\w$])(?!\s*=(?!=))/g,
+    out = out.replace(/(?<![.\w$])(?:window|document|self|top|parent|globalThis|global)\??\.location(?![.\w$])(?!\s*=(?!=))/g,
       (w) => '__ohLoc');
+    /* v1.1: the React Router 7 history read — the ONE whole-object window
+     * location read that survives every defense above: it lives behind a
+     * RENAMED PARAM (a.location, minified from win.location) inside a
+     * destructure, so the generic param form can't be touched (x.location
+     * is how data objects, frames and popups are read too). But the
+     * SHAPE is build-stable — pathname/search/hash are fixed by the
+     * Location interface, only the aliases and the receiver rename per
+     * build:
+     *   {pathname:i,search:l,hash:s}=o||a.location
+     * Surgical rule, and the rewrite CARRIES ITS OWN FALLBACK —
+     * `a.__ohLoc||a.location` — so any false positive (a data object
+     * with a location field) reads the ORIGINAL property back: only the
+     * sandbox window has __ohLoc, everything else is untouched. In the
+     * sandbox this turns the router's initial location from
+     * about:srcdoc (pathname "srcdoc" → no route matched → the plain
+     * "404 Not Found" page) into the real upstream URL. */
+    out = out.replace(/(\{\s*pathname\s*:\s*[\w$]{1,4}\s*,\s*search\s*:\s*[\w$]{1,4}\s*,\s*hash\s*:\s*[\w$]{1,4}\s*\}\s*=(?:[^;,={}]{0,60}\|\||&&)?\s*)([A-Za-z_$][\w$]{0,15})\.location\b(?![.\w$(])/g,
+      (w, pre, id) => pre + id + '.__ohLoc||' + id + '.location');
     return out;
   } catch (e) {
     return text;
