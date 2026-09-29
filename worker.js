@@ -23,6 +23,23 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — worker.js
+ * BUILD: ohp service 1.3 (cloud-app-era fixes + the keep-alive
+ *   promise made whole: the current OpenHands product is the CANVAS
+ *   app served at app.all-hands.dev/canvas — its runtime layer talks
+ *   to per-conversation hosts through POST /api/cloud-proxy on the
+ *   app origin and the event socket stays a bare wss:// upgrade; both
+ *   are plain relay traffic. New in 1.3:
+ *   - a 'nav' shell command for the sandboxed app view: the pocket's
+ *     cloud agents card opens a conversation directly (the card's
+ *     rows are tappable; the shell boots the app, waits for hello,
+ *     then orders the same nav() an in-app link would have made);
+ *   - the stale-worker warning moved up into the hero card with a
+ *     one-time toast — an old worker cannot load the current app
+ *   (missing the transparent-root routing for /canvas assets), and
+ *   that mismatch is the top source of "no backend / app won't
+ *   load" reports. The cron keep-alive, the on-open refresh and
+ *   the /__session cloud snapshot are unchanged and verified
+ *   end-to-end.
  * BUILD: ohp service 1.2 (existing-conversation fixes: the websocket
  *   branch moved BEFORE the __t-query cleanup so a token-carrying
  *   WS handshake is proxied instead of 302-redirected to death —
@@ -156,7 +173,7 @@ const OWNER_KEY = "";
  *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.2';
+const VERSION = 'ohp service 1.3';
 
 /* OpenHands Cloud family + the hosts its sign-in needs (suffix
  * match — covers every subdomain: runtime sandboxes, CDN, auth). */
@@ -1933,6 +1950,13 @@ const PATCH_JS = [
 "        if (d.cmd === 'forward') { up({ type: 'gofwd' }); return; }",
 "        if (d.cmd === 'reload') { up({ type: 'reloadreq' }); return; }",
 "        if (d.cmd === 'navigate') { if (d.url) nav(String(d.url)); return; }",
+"        /* v1.3: the same steering for the sandboxed app view — the",
+"         * cloud agents card opens a conversation directly: the shell",
+"         * opens the app, waits for hello, then orders this nav. It",
+"         * rides the app's own nav() so the re-render, the history",
+"         * entry and the session seed all behave exactly like an",
+"         * in-app navigation would. */",
+"        if (d.cmd === 'nav' && d.url) { try { nav(String(d.url)); } catch (eN2) { /* ignore */ } return; }",
 "      }",
 "      switch (d.cmd) {",
 "        case 'init':",
@@ -3669,7 +3693,19 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
         if (bOp) inject = '<base href="' + (workerOrigin ? workerOrigin.replace(/\/$/, '') : '') + bOp + '">' + inject;
       } catch (eB) { /* ignore */ }
     }
-    if (/<head[^>]*>/i.test(text)) text = text.replace(/<head[^>]*>/i, (m) => m + inject);
+    /* v1.3: inject at the END of <head>. Injecting at the head's
+     * START put our <base>/<style>/<script> BEFORE the app's own
+     * tags, and React 19 hydrates the WHOLE document in child order:
+     * unexpected leading nodes make the server HTML mismatch the
+     * client tree -> React #418 ("Hydration failed ... will be
+     * regenerated"), and react-router escalates any hydrate throw to
+     * its errorElement — the current OpenHands app turns that into a
+     * full-page reload page, which reloads the SAME document forever.
+     * Trailing extra nodes at the head's END are tolerated instead.
+     * The patch still runs first in effect: it is a classic script,
+     * the app's modules are deferred, so it executes during parse. */
+    if (/<\/head>/i.test(text)) text = text.replace(/<\/head>/i, (m) => inject + m);
+    else if (/<head[^>]*>/i.test(text)) text = text.replace(/<head[^>]*>/i, (m) => m + inject);
     else if (/<html[^>]*>/i.test(text)) text = text.replace(/<html[^>]*>/i, (m) => m + inject);
     else text = inject + text;
     return text;
