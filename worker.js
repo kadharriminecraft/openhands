@@ -23,6 +23,27 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — worker.js
+ * BUILD: ohp service 1.5 (the ACTIVE-USE resume-watchdog fix — a
+ *   shell-side false positive, re-versioned so the pair stays in
+ *   lockstep: the canvas app syncs its conversation timeline over
+ *   REST and only uses websockets for live terminal streams, so a
+ *   socket closing while the user is actively on the page is
+ *   NORMAL, not death. v1.4 watched sockets while the user was
+ *   right there: every ordinary close (task finished, idle
+ *   timeout) reddened the status dot, and 20s later a 3.5s probe
+ *   on a busy phone looked like silence — "the app view went
+ *   quiet while you were away", reload, the app reopens a socket,
+ *   it closes again, reload… three times in a row. The shell (and
+ *   only the shell — the worker runtime is functionally unchanged
+ *   here) now treats the dot as pure doc liveness: any health
+ *   answer is alive, a socket close while visible arms ONE delayed
+ *   liveness check, and the only thing auto-healed while the user
+ *   is watching is a doc that ignores two probes 6s apart; socket
+ *   state is judged solely after a real absence, against the real
+ *   hidden-since time, with a doubled probe window so a busy phone
+ *   re-rendering the conversation is never mistaken for a hung one.
+ *   Deploy check: /__status on the worker URL must answer
+ *   "ohp service 1.5" — anything older is a stale copy.)
  * BUILD: ohp service 1.3 (cloud-app-era fixes + the keep-alive
  *   promise made whole: the current OpenHands product is the CANVAS
  *   app served at app.all-hands.dev/canvas — its runtime layer talks
@@ -173,7 +194,7 @@ const OWNER_KEY = "";
  *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.4';
+const VERSION = 'ohp service 1.5';
 
 /* v1.4 (resume watchdog): the runtime patch now tracks every app
  * websocket (window.__OH_WS__) and reports live health to the shell
