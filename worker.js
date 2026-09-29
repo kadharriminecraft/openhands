@@ -23,12 +23,22 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — worker.js
- * BUILD: ohp service 1.1 (transparent-root fix: the OpenHands app
- *   boots — inline module imports and the React Router manifest's
- *   root-absolute /assets/... paths stopped 404ing at the relay root,
- *   which left the sandbox a blank page)
+ * BUILD: ohp service 1.2 (existing-conversation fixes: the websocket
+ *   branch moved BEFORE the __t-query cleanup so a token-carrying
+ *   WS handshake is proxied instead of 302-redirected to death —
+ *   that redirect is why the conversation event socket never opened
+ *   on token-gated relays and every WS-gated control (the
+ *   connect-repo button on an existing conversation) stayed
+ *   disabled while chat limped along on the queued-message
+ *   fallback; plus the popup overlay protocol — target=_blank /
+ *   window.open to allowed hosts now raise 'popupreq' and the shell
+ *   paints an overlay pane so the GitHub App install flow and
+ *   repo/branch/PR links stop navigating the whole sandbox away —
+ *   and the mobile dialog clamp CSS so the app's desktop-sized
+ *   settings modals stay on-screen and scrollable in the
+ *   phone-sized sandbox)
  *   Deploy check: /__status on the worker URL must answer
- *   "ohp service 1.1" — anything older is a stale copy.
+ *   "ohp service 1.2" — anything older is a stale copy.
  * ------------------------------------------------------------
  * WHAT THIS DOES
  *   A faithful port of the z.ai pocket relay architecture
@@ -146,7 +156,7 @@ const OWNER_KEY = "";
  *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.1';
+const VERSION = 'ohp service 1.2';
 
 /* OpenHands Cloud family + the hosts its sign-in needs (suffix
  * match — covers every subdomain: runtime sandboxes, CDN, auth). */
@@ -273,6 +283,14 @@ const PATCH_JS = [
 "                                      // painted into a null-origin srcdoc frame by",
 "                                      // the pocket shell. NEVER navigate: every",
 "                                      // destination goes to the shell by postMessage.",
+"  var POP = false;                  // v1.2: TRUE when this document is the shell's",
+"                                      // popup overlay pane (external target=_blank",
+"                                      // destinations: the GitHub App install flow,",
+"                                      // repo/branch/PR links). Every up() message is",
+"                                      // stamped pop:1 so the shell routes it to the",
+"                                      // overlay frame, and a popup opened FROM a",
+"                                      // popup navigates the pane itself.",
+"  try { POP = !!(CFG.pop || window.__OH_POP__); } catch (ePP) { POP = false; }",
 "",
 "  var jar = [];                       // fallback cookie jar (mirrored by the shell)",
 "  var lsMirror = {};                  // fallback localStorage mirror (for browsers that block it in iframes)",
@@ -318,6 +336,27 @@ const PATCH_JS = [
 "      var upUrl = '';",
 "      try { upUrl = new URL(s, DOC || location.href).href; } catch (eU) { upUrl = s; }",
 "      up({ type: 'navreq', url: mapped, up: upUrl, method: method || 'GET', body: body || null, ct: ct || null });",
+"      return s;",
+"    } catch (e) { return u; }",
+"  }",
+"",
+"  /* ---------- v1.2: popup request to the shell -----------------------",
+"   * target=_blank anchors and window.open calls to ALLOWED hosts mean",
+"   * \"keep this page, open that elsewhere\" — on the real site a browser",
+"   * tab. The sandbox can never spawn one (a real popup would hit the",
+"   * org filter on its first navigation), so the shell paints an overlay",
+"   * pane instead: same sandbox machinery, same session jar, and the app",
+"   * underneath keeps every bit of state. This is what makes the",
+"   * connect-repo flow work on an existing conversation — the GitHub",
+"   * App install page opens in the pane, Done returns to the chat, and",
+"   * the repo dropdown refetches with the new installation. */",
+"  function pop(u) {",
+"    try {",
+"      var s = (u == null) ? '' : String(u);",
+"      var mapped = mapUrl(s);",
+"      var upUrl = '';",
+"      try { upUrl = new URL(s, DOC || location.href).href; } catch (eU2) { upUrl = s; }",
+"      up({ type: 'popupreq', url: mapped, up: upUrl, method: 'GET', body: null, ct: null });",
 "      return s;",
 "    } catch (e) { return u; }",
 "  }",
@@ -456,6 +495,7 @@ const PATCH_JS = [
 "  function up(msg) {",
 "    try {",
 "      msg.oh = 1;",
+"      if (POP) msg.pop = 1;",
 "      if (window.parent && window.parent !== window) window.parent.postMessage(msg, '*');",
 "    } catch (e) { /* ignore */ }",
 "  }",
@@ -1205,16 +1245,19 @@ const PATCH_JS = [
 "      var u = url == null ? '' : String(url);",
 "      if (!u || u === 'about:blank') return stubWindow();",
 "      if (SD) {",
-"        /* v5 sandbox: no popups from the sandbox \u2014 in-app navigation or",
-"         * the external notice, never a real window (its first navigation",
-"         * would hit the org filter). */",
-"        if (isWorkerUrl(u)) { nav(u); return stubWindow(); }",
+"        /* v1.2 sandbox: a real popup can never leave this frame (the org",
+"         * filter would eat its first navigation), so the shell paints one.",
+"         * window.open to an allowed destination becomes a 'popupreq' —",
+"         * the overlay opens over an UNTOUCHED app (the connect-repo",
+"         * GitHub App install button, the /slack/install helper). Inside",
+"         * the overlay itself (POP) the same call just navigates the pane. */",
+"        if (isWorkerUrl(u)) { if (POP) nav(u); else pop(u); return stubWindow(); }",
 "        if (/^https?:\\/\\//i.test(u) && !allowedHost((u.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1])) {",
 "          up({ type: 'ext', url: u });",
 "          pageToast('Blocked (outside the proxy): ' + u);",
 "          return stubWindow();",
 "        }",
-"        nav(u);",
+"        if (POP) nav(u); else pop(u);",
 "        return stubWindow();",
 "      }",
 "      var mapped = mapUrl(u);",
@@ -1309,15 +1352,23 @@ const PATCH_JS = [
 "      var target = (a.target || '').toLowerCase();",
 "      if (SD) {",
 "        /* v5 sandbox: NOTHING navigates \u2014 every link becomes a nav()",
-"         * postMessage and the shell re-renders a fresh srcdoc. */",
+"         * postMessage and the shell re-renders a fresh srcdoc.",
+"         * v1.2: target=_blank (or rel=noopener) anchors are different \u2014",
+"         * they mean \"keep me here, open that THERE\": the GitHub App",
+"         * install link inside the repo dropdown, the repo/branch/PR",
+"         * chips, the TOS/privacy footnotes. Those become 'popupreq' and",
+"         * the shell paints its overlay pane; from inside the overlay",
+"         * they navigate the pane itself. */",
 "        e.preventDefault();",
-"        if (isWorkerUrl(href)) { nav(href); return; } /* worker-rewritten attr */",
+"        var wantsPop = target === '_blank' || /(^|\\s)noopener(\\s|$)/.test(a.getAttribute('rel') || '');",
+"        if (wantsPop && POP) wantsPop = false;",
+"        if (isWorkerUrl(href)) { if (wantsPop) pop(href); else nav(href); return; } /* worker-rewritten attr */",
 "        if (/^https?:\\/\\//i.test(href) && !allowedHost((href.match(/^https?:\\/\\/([^\\/?#]+)/i) || [])[1])) {",
 "          up({ type: 'ext', url: href });",
 "          pageToast('Blocked (outside the proxy): ' + href);",
 "          return;",
 "        }",
-"        nav(href);",
+"        if (wantsPop) pop(href); else nav(href);",
 "        return;",
 "      }",
 "      var mapped = mapUrl(href);",
@@ -2516,6 +2567,23 @@ async function handle(req, event) {
       return json({ error: 'unauthorized', hint: 'set X-Proxy-Token header or __t query param' }, req, 401);
     }
 
+    /* ---- websocket upgrade ----
+     * MUST run before the __t-query cleanup below: a WebSocket
+     * handshake can never follow a 302, so redirecting a
+     * token-carrying ws://...?__t=... kills the connection on the
+     * spot. That is exactly how the sandbox's conversation socket
+     * died on token-gated relays (PROXY_TOKEN set): the runtime
+     * wrapper appends ?__t= to every ws:// it proxies (WS cannot
+     * carry headers), the cleanup answered 302, and the app's event
+     * stream never opened — chat limped along on the queued-message
+     * fallback while every WS-gated control (the connect-repo button
+     * on an existing conversation chief among them) stayed disabled.
+     * checkToken above has already validated the token from the
+     * query, so this branch can proxy straight through. */
+    if (req.headers.get('upgrade') === 'websocket') {
+      return proxyWebsocket(req, url, event);
+    }
+
     /* ---- token was supplied in the query: remember it, clean the URL ---- */
     if (token && url.searchParams.has('__t')) {
       const clean = new URL(req.url);
@@ -2548,11 +2616,6 @@ async function handle(req, event) {
       });
       seen.forEach((n) => h.append('set-cookie', n + '=; Path=/; Max-Age=0; Secure; SameSite=None; Partitioned'));
       return new Response(null, { status: 302, headers: corsHeaders(req, h) });
-    }
-
-    /* ---- websocket upgrade ---- */
-    if (req.headers.get('upgrade') === 'websocket') {
-      return proxyWebsocket(req, url, event);
     }
 
     /* ---- route resolution ---- */
@@ -3583,10 +3646,23 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
      * import("./chunk.js") inside inline scripts, form submits without
      * actions) would all die. With <base> they resolve onto the worker,
      * path-preserved. The runtime's document.baseURI override still
-     * reports the upstream URL to the app, so routers hydrate right. */
+     * reports the upstream URL to the app, so routers hydrate right.
+     *
+     * v1.2 also injects the mobile-dialog clamp: the app sizes its
+     * modals for a desktop viewport (w-[700px] bodies, no max-height,
+     * a fixed flex-centered overlay that cannot scroll), so inside the
+     * phone-sized sandbox the settings popups hung off-screen with
+     * their action buttons unreachable. These rules make the dialog
+     * layer itself scroll and cap the panel at the viewport — on a
+     * desktop viewport nothing changes (the caps never engage). */
+    const OHP_UI_CSS = '<sty' + 'le>' +
+      'div[role="dialog"][aria-modal="true"]{overflow-y:auto!important;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}' +
+      'div[role="dialog"][aria-modal="true"]>div.relative{max-width:calc(100vw - 24px)!important;max-height:calc(100vh - 24px)!important;max-height:calc(100dvh - 24px)!important;margin:12px!important;overflow-y:auto!important}' +
+      'div[role="dialog"][aria-modal="true"] .bg-base-secondary{max-width:100%!important;max-height:100%!important}' +
+      '</sty' + 'le>';
     const cfg = { pfx: pfx, host: host, worker: workerOrigin, token: token || '', allow: allow,
       key: TOK_KEY, tok: !!tokDoc, doc: tokDoc || '', sd: !!tokDoc };
-    let inject = '<scr' + 'ipt>window.__OH__=' + JSON.stringify(cfg) + ';' + PATCH_JS + '</scr' + 'ipt>';
+    let inject = OHP_UI_CSS + '<scr' + 'ipt>window.__OH__=' + JSON.stringify(cfg) + ';' + PATCH_JS + '</scr' + 'ipt>';
     if (tokDoc) {
       try {
         const bOp = oTokPath(tokDoc);
