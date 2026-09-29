@@ -1,14 +1,19 @@
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — openhands-worker.js
- * BUILD: ohp service 1.2 (adds v6.10: navigation-chain mode — the
- *   worker walks the OAuth sign-in redirect chain itself, folding
- *   every hop's Set-Cookie into the next hop and re-issuing the union
- *   on the final response, so sign-ins survive browsers that cannot
- *   store this origin's cookies; jar-over-browser cookie precedence;
- *   precise 502 diagnostics when a provider redirect leaves the
- *   allowlist. Keeps v6.9 form.submit() + x-ohp-up/x-ohp-errbody.)
+ * BUILD: ohp service 1.3 (adds v6.11: hop-trace diagnostics — every
+ *   navigation-chain response carries x-ohp-hops, the full
+ *   status+URL of every upstream hop, and the pocket's error card
+ *   renders the chain, so a failed sign-in names the exact failing
+ *   hop; 404 joined the per-hop minimal-header retry set — GitHub's
+ *   authorize endpoint occasionally answers a plain-text 404 "Not
+ *   Found" to worker egress (bot mitigation) and one clean retry
+ *   rescues the chain; the neutral 404 identifies as service "ohp"
+ *   and carries x-ohp-up/x-ohp-errbody; the error card prefers the
+ *   worker's own hop account over the sandbox's pre-flight guess.
+ *   Keeps v6.10 chain cookie folding + v6.9 form.submit() + errbody
+ *   diagnostics.)
  *   Deploy check: /__status on the worker URL must answer
- *   "ohp service 1.2" — anything else means an old copy is
+ *   "ohp service 1.3" — anything else means an old copy is
  *   still deployed; replace it with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES — the "no-navigation" architecture, ported
@@ -113,7 +118,7 @@
  *     them as x-cookie. Nothing is stored at this origin.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.2';
+const VERSION = 'ohp service 1.3';
 
 /* OpenHands first-party family (suffix match — covers subdomains).
  * all-hands.dev covers app.all-hands.dev (the app + its API),
@@ -415,7 +420,7 @@ const PATCH_JS = [
 "  }",
 "",
 "  /* ---------- v5: window.name boot hydration --------------------------",
-"   * The shell stamps the frame's name with a snapshot {zp:1, ls, jar}",
+"   * The shell stamps the frame's name with a snapshot {ohp:1, ls, jar}",
 "   * BEFORE assigning the srcdoc \u2014 it is readable synchronously here,",
 "   * so the app's own scripts (which run after this patch) find their",
 "   * session cookies and localStorage already populated. No race. */",
@@ -2171,8 +2176,17 @@ async function handle(req, event) {
       /* v5: bare paths never mirror the upstream — the transparent
        * catch-all is GONE. Nothing navigates to this worker; the only
        * content route is /__t/<token>. Answer a neutral 404 so the
-       * origin never serves anything classifiable. */
-      return json({ ok: false, service: 'zp', status: 404, note: 'nothing is served at this path' }, req, 404);
+       * origin never serves anything classifiable. v6.11: identifies
+       * as service "ohp" (the z-family leftover is gone) and carries
+       * the diagnostics so the pocket's card names the worker path. */
+      {
+        const rh404 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        rh404.set('x-ohp-up', req.url);
+        rh404.set('x-ohp-errbody', encodeURIComponent('The sandbox asked this relay for a path it does not serve: ' +
+          url.pathname.slice(0, 140) + ' — a navigation token was lost. Tap Retry.'));
+        return new Response(JSON.stringify({ ok: false, service: 'ohp', status: 404, note: 'nothing is served at this path' }),
+          { status: 404, headers: corsHeaders(req, rh404) });
+      }
     }
 
     /* ---- query handling ----
@@ -2268,6 +2282,9 @@ async function handle(req, event) {
     const navMode = (req.headers.get('x-ohp-nav') || '') === '1' && !needDuplex;
     const chainCookies = []; /* raw Set-Cookie strings from every followed hop */
     const chainHosts = [];  /* distinct upstream hosts visited, for diagnostics */
+    const chainTrace = [];  /* v6.11: "<status> <url>" per hop — x-ohp-hops, so the
+                             * pocket's error card can show the EXACT failing hop
+                             * instead of the URL the sandbox guessed it loaded */
     const CHAIN_MAX_HOPS = 20;
     const rawSetCookies = (r) => {
       try {
@@ -2283,9 +2300,14 @@ async function handle(req, event) {
      * forwarded edge headers) recovers those; anything that survives it
      * is a real answer and passes through untouched. OpenHands auth
      * failures (401) are NOT retried — an expired token will not heal in
-     * place, and the app's own login flow owns it. */
+     * place, and the app's own login flow owns it. v6.11: 404 joins the
+     * set for GET/HEAD hops — github.com/login/oauth/authorize has been
+     * observed answering a plain-text 404 "Not Found" to worker egress
+     * (bot mitigation on the datacenter IP) while the same path serves
+     * 302/200 to a clean request; one minimal-header retry rescues the
+     * whole sign-in chain. */
     const hopRetry = async (r, u, m) => {
-      if ((r.status === 403 || r.status === 429) && (m === 'GET' || m === 'HEAD')) {
+      if ((r.status === 403 || r.status === 429 || r.status === 404) && (m === 'GET' || m === 'HEAD')) {
         try {
           const r2 = await fetch(u, { method: m, headers: minimalHeaders(req, new URL(u).host), redirect: 'manual' });
           retried = true; /* a retry attempt happened — tagged either way */
@@ -2320,6 +2342,7 @@ async function handle(req, event) {
           if (curBody !== undefined && curMethod !== 'GET' && curMethod !== 'HEAD') fi.body = curBody;
           res = await fetch(curUrl.toString(), fi);
           res = await hopRetry(res, curUrl.toString(), curMethod);
+          chainTrace.push(res.status + ' ' + curUrl.toString().slice(0, 400));
           if (chainHosts.indexOf(curUrl.host) < 0) chainHosts.push(curUrl.host);
           const st = res.status;
           const loc2 = res.headers.get('location');
@@ -2332,6 +2355,7 @@ async function handle(req, event) {
           if (hop === CHAIN_MAX_HOPS) {
             const rh502 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
             rh502.set('x-ohp-up', curUrl.toString());
+            rh502.set('x-ohp-hops', encodeURIComponent(chainTrace.join(' | ')));
             rh502.set('x-ohp-errbody', encodeURIComponent('The sign-in flow bounced between ' + chainHosts.join(', ') +
               ' without finishing — an SSO/identity-provider page is likely refusing the relay. Tap Retry, or sign in with a different method.'));
             return new Response(JSON.stringify({ error: 'redirect chain too long', hosts: chainHosts }), { status: 502, headers: corsHeaders(req, rh502) });
@@ -2339,6 +2363,7 @@ async function handle(req, event) {
           if (!hostAllowed(abs.host, event)) {
             const rh502 = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
             rh502.set('x-ohp-up', curUrl.toString());
+            rh502.set('x-ohp-hops', encodeURIComponent(chainTrace.join(' | ')));
             rh502.set('x-ohp-errbody', encodeURIComponent('The sign-in flow tried to leave the relay to ' + abs.host +
               ' — that host is not in the worker allowlist. Add it to the EXTRA_HOSTS variable (comma-separated) in this Cloudflare worker and try again.'));
             return new Response(JSON.stringify({ error: 'redirect to unallowed host', host: abs.host, hint: 'add EXTRA_HOSTS to the worker env', visited: chainHosts }), { status: 502, headers: corsHeaders(req, rh502) });
@@ -2392,6 +2417,9 @@ async function handle(req, event) {
     reissueRawCookies(recoveryCookies.concat(chainCookies), outHeaders);
     maybeSetTokenCookie(req, outHeaders, event);
     outHeaders.set('x-final-url', res.url || upUrl.toString());
+    if (navMode && chainTrace.length) {
+      try { outHeaders.set('x-ohp-hops', encodeURIComponent(chainTrace.join(' | '))); } catch (eTr) { /* never let tracing break a response */ }
+    }
     if (retried) outHeaders.set('x-ohp-retry', (retried === 'dropauth' || retried === 'capacity') ? retried : '1');
     const outCt = corsHeaders(req, outHeaders);
 
@@ -2689,7 +2717,7 @@ function corsHeaders(req, h) {
   h.set('access-control-allow-methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
   const reqH = req.headers.get('access-control-request-headers');
   h.set('access-control-allow-headers', reqH || '*');
-  h.set('access-control-expose-headers', 'content-disposition, content-type, location, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-errbody, x-ohp-up');
+  h.set('access-control-expose-headers', 'content-disposition, content-type, location, x-set-cookie, x-final-url, filename, x-ohp-retry, x-ohp-jsrw, x-jar-seed, x-ohp-errbody, x-ohp-up, x-ohp-hops');
   h.set('access-control-max-age', '86400');
   return h;
 }
