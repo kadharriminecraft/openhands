@@ -23,6 +23,29 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * OpenHands pocket — Cloudflare Worker relay — worker.js
+ * BUILD: ohp service 1.6 (the LEAVE-ME-ALONE release + the repo
+ *   attach audit: while the page is visible the shell now does
+ *   NOTHING to the app view — no probes, no timers, no reloads,
+ *   ever; the only automatic touch left is the real
+ *   return-from-absence heal. v1.5 had replaced the blind socket
+ *   reload with a liveness check, but a busy or mid-load doc on a
+ *   real phone can still miss a 12s ping window, and any reload
+ *   under an actively-using user is one too many — the cloud agent
+ *   runs server-side, the app syncs over REST, and the reload
+ *   arrow stays one tap away if the user ever wants it.
+ *   Also audited end-to-end against the REAL canvas bundle: the
+ *   GitHub "Connect Repo" flow on an existing conversation (the
+ *   task- route bootstrap -> start-tasks -> app_conversation_id
+ *   redirect -> conversation batch-get -> git installations/
+ *   repositories/branches searches -> the Open Repository modal
+ *   -> the attach mutation -> the "Clone ... from Github ..." chat
+ *   message over the live events websocket) runs COMPLETELY through
+ *   this relay — chip enabled, dropdowns populated, clone message
+ *   delivered. The chip is gated by the app itself on its events
+ *   socket being OPEN; a relay running anything older than 1.2's
+ *   websocket fix kills that socket (chat still limps along on the
+ *   app's REST fallback, masking it) — deploy check: /__status on
+ *   the worker URL must answer "ohp service 1.6".)
  * BUILD: ohp service 1.5 (the ACTIVE-USE resume-watchdog fix — a
  *   shell-side false positive, re-versioned so the pair stays in
  *   lockstep: the canvas app syncs its conversation timeline over
@@ -194,7 +217,7 @@ const OWNER_KEY = "";
  *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.5';
+const VERSION = 'ohp service 1.6';
 
 /* v1.4 (resume watchdog): the runtime patch now tracks every app
  * websocket (window.__OH_WS__) and reports live health to the shell
