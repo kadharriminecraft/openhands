@@ -217,7 +217,22 @@ const OWNER_KEY = "";
  *     resets it.
  * ============================================================ */
 
-const VERSION = 'ohp service 1.6';
+const VERSION = 'ohp service 1.7';
+
+/* v1.7 (cloud send fallback): the canvas app's composer has a REST
+ * fallback for when the conversation's events socket is not OPEN —
+ * but it builds its agent-server options with NO conversation URL,
+ * which in cloud mode throws NoBackendAvailableError ("No backend is
+ * configured.") before any request is made. On the real site the
+ * socket is reliably open so the path is dead code; through the
+ * pocket an idle-killed / reconnecting socket turns the 2nd message
+ * in a conversation into exactly that error. The JS pass now surgically
+ * rewrites that one minified callback so the fallback passes the
+ * conversation's conversation_url + session_api_key (the same shape
+ * the app's own respondToConfirmation/getEventCount wrappers use),
+ * and a dead socket degrades to a delivered REST event instead of a
+ * thrown error. Exact-shape match only — a missed match leaves the
+ * bundle byte-identical. */
 
 /* v1.4 (resume watchdog): the runtime patch now tracks every app
  * websocket (window.__OH_WS__) and reports live health to the shell
@@ -3266,7 +3281,10 @@ async function handle(req, event) {
      * entire bundle at parse time. */
     if (tokMode && /javascript|ecmascript|text\/jscript/i.test(ct)) {
       const text = await res.text();
-      const js = rewriteJsLocation(text);
+      /* v1.7: the send-fallback patch runs after the location pass —
+       * it rewrites exactly one minified callback in the composer's
+       * chunk (exact-shape match; other bundles pass through). */
+      const js = patchCloudSendFallback(rewriteJsLocation(text));
       if (js !== text) {
         const h2 = new Headers(outCt);
         h2.set('x-ohp-jsrw', '1');
@@ -3874,6 +3892,49 @@ function rewriteCss(text, pfx, host, allow, tokDoc, workerOrigin) {
  *       captcha SCENE_ID getter. Left raw, `window.location` in the
  *       sandbox is about:srcdoc (hostname ""), and every captcha token
  *       was minted for the wrong scene, so z.ai rejected every solve. */
+/* ---------------- v1.7: cloud send-fallback patch ----------------
+ * The canvas app's composer send (markdown-renderer chunk) has two
+ * paths: over the events WebSocket when OPEN, else "queue via REST":
+ *
+ *   H=(0,U.useCallback)(async e=>{let n=I.getState().conversationMode,
+ *     r=n===`plan`?V:B,i=n===`plan`?L:t;
+ *     if(r?.readyState!==WebSocket.OPEN){ ...
+ *       return await new re(ne()).sendEvent(i,{role:`user`,...},{run:!0})
+ *
+ * ne() = buildAgentServerOptions() with NO arguments — in cloud mode
+ * the active backend is kind:'cloud' (never 'local'), so the options
+ * builder throws NoBackendAvailableError ("No backend is configured.")
+ * before a single request is made. On the real site the socket is
+ * reliably open; through the pocket an idle-killed or reconnecting
+ * socket makes the 2nd+ message in a conversation fail with exactly
+ * that toast (the 1st message rides on conversation creation and never
+ * touches this path).
+ *
+ * The provider that owns H receives conversationUrl (n), sessionApiKey
+ * (i) and subConversations (a) as props — but H's own minified locals
+ * shadow n and i. The surgical fix renames those two locals (ohm/ohi)
+ * and passes the provider's props into the options builder — the same
+ * {conversationUrl, sessionApiKey} shape the app's own
+ * respondToConfirmation / getEventCount wrappers (Vn) already use for
+ * this exact client. Plan mode resolves its sub-conversation object
+ * from `a` (the same source the plan socket's own options use).
+ *
+ * Exact-shape replacement only: if the bundle changes even one byte
+ * of this callback, the pattern misses and the app is served
+ * untouched (the original throw simply comes back). */
+const CLOUD_SEND_ORIG = 'H=(0,U.useCallback)(async e=>{let n=I.getState().conversationMode,r=n===`plan`?V:B,i=n===`plan`?L:t;if(r?.readyState!==WebSocket.OPEN){if(!i){let e=Error(n===`plan`?`Planning conversation is not ready yet`:`No conversation ID available`);throw _(e.message),e}try{return await new re(ne()).sendEvent(i,{role:`user`,content:e.content},{run:!0}),{queued:!0}}catch(e){throw _(e instanceof Error?e.message:`Failed to queue message for delivery`),e}}try{return r.send(JSON.stringify({...e,run:!0})),{queued:!1}}catch(e){throw _(e instanceof Error?e.message:`Failed to send message`),e}},[B,V,_,t,L])';
+const CLOUD_SEND_NEW = 'H=(0,U.useCallback)(async e=>{let ohm=I.getState().conversationMode,r=ohm===`plan`?V:B,ohi=ohm===`plan`?L:t;if(r?.readyState!==WebSocket.OPEN){if(!ohi){let e=Error(ohm===`plan`?`Planning conversation is not ready yet`:`No conversation ID available`);throw _(e.message),e}try{let ohc=ohm===`plan`?(a&&a[0])||null:{conversation_url:n,session_api_key:i};return await new re(ne({conversationUrl:ohc?ohc.conversation_url:void 0,sessionApiKey:ohc?(ohc.session_api_key??i):void 0})).sendEvent(ohi,{role:`user`,content:e.content},{run:!0}),{queued:!0}}catch(e){throw _(e instanceof Error?e.message:`Failed to queue message for delivery`),e}}try{return r.send(JSON.stringify({...e,run:!0})),{queued:!1}}catch(e){throw _(e instanceof Error?e.message:`Failed to send message`),e}},[B,V,_,t,L])';
+function patchCloudSendFallback(text) {
+  try {
+    if (typeof text !== 'string') return text;
+    if (text.indexOf('new re(ne()).sendEvent') < 0) return text;   /* fast reject: only the composer chunk carries it */
+    if (text.indexOf(CLOUD_SEND_ORIG) < 0) return text;            /* shape drifted: leave the bundle untouched */
+    return text.replace(CLOUD_SEND_ORIG, CLOUD_SEND_NEW);
+  } catch (e) {
+    return text;
+  }
+}
+
 function rewriteJsLocation(text) {
   try {
     if (!/location\b/.test(text)) return text;
